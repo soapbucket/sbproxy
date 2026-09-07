@@ -21,6 +21,7 @@ ten-minute build.
 | AI dispatch stack budget | `bash scripts/check-stack-budget-ratchet.sh` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
+| expect_err on non-Debug types | `bash scripts/check-expect-err-non-debug.sh` |
 | NOTICE (Apache-2.0-only) | `bash scripts/check-notice.sh` |
 | Doc drift | `bash scripts/check-doc-drift.sh` |
 | Tapes + GIF wiring | `make tapes-check` |

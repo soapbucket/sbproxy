@@ -9,8 +9,8 @@
 //! the engine's concurrency, decide whether a new request is admitted,
 //! queued, or admitted by preempting a lower-priority one (ProServe's
 //! single-queue, selective-preemption approach). Binding a class to a
-//! virtual key and driving real preemption is the request-path wiring
-//! (enterprise), which reuses this decision.
+//! virtual key and driving real preemption is the request-path
+//! wiring, which reuses this decision.
 
 /// A request's SLO priority, highest first.
 #[derive(

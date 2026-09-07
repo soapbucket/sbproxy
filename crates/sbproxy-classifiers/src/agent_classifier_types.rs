@@ -1,17 +1,17 @@
 //! ML agent classifier output types.
 //!
 //! These are the canonical type definitions for the ML agent
-//! classifier verdict. They live in the OSS classifiers crate so the
-//! OSS [`crate`]'s downstream consumers (`sbproxy-core::RequestContext`,
+//! classifier verdict. They live in the classifiers crate so
+//! [`crate`]'s downstream consumers (`sbproxy-core::RequestContext`,
 //! the CEL/Lua/JS scripting layers, the access log emitter, ...) can
-//! hold the verdict without taking a dependency on the enterprise
-//! classifier sidecar crate.
+//! hold the verdict without taking a dependency on the
+//! `sbproxy-classifier` sidecar crate.
 //!
 //! The actual ONNX inference, feature builder, hot-swap registry, and
-//! `BehavioralStore` plumbing live in the enterprise crate
-//! `sbproxy-classifier::agent_classifier`. The OSS surface is purely
-//! the value types: an enum for the four output classes plus a struct
-//! that records confidence and provenance.
+//! `BehavioralStore` plumbing live in `sbproxy-classifier`'s
+//! `agent_classifier` module. This crate's surface is purely the value
+//! types: an enum for the four output classes plus a struct that
+//! records confidence and provenance.
 //!
 //! # Closed-enum amendment
 //!

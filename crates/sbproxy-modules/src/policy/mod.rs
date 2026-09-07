@@ -205,7 +205,7 @@ pub enum Policy {
     OpenApiValidation(OpenApiValidationPolicy),
     /// `prompt_injection_v2`: scoring detector + configurable action.
     /// Holds a swappable [`Detector`] and either tags, blocks, or
-    /// logs requests whose prompt scores above the threshold. The OSS
+    /// logs requests whose prompt scores above the threshold. This
     /// build registers a heuristic detector by default; the trait is
     /// designed so a future ONNX classifier can plug in cleanly.
     PromptInjectionV2(PromptInjectionV2Policy),

@@ -8,12 +8,11 @@
 //!
 //! The enterprise source stopped at selecting a variant and returning an
 //! abstract "proxy" outcome; the source's plugin dispatch resolved what
-//! that meant. OSS's built-in actions have no such indirection, so the
-//! selected variant's URL is resolved to a real `(host, port, tls)`
+//! that meant. This crate's built-in actions have no such indirection, so
+//! the selected variant's URL is resolved to a real `(host, port, tls)`
 //! upstream target here (mirroring [`super::ProxyAction::parse_upstream`])
-//! and carried on the request context by
-//! `sbproxy-core`'s `handle_action`, which is what makes the request
-//! actually reach the chosen backend.
+//! and carried on the request context by `sbproxy-core`'s `handle_action`,
+//! which is what makes the request actually reach the chosen backend.
 
 use rand::Rng;
 use serde::Deserialize;
@@ -235,8 +234,8 @@ mod tests {
         assert!(err.to_string().contains("variants"));
     }
 
-    // --- resolve_variant / parse_variant_upstream (the OSS-specific
-    // seam that replaces the source's `handle()` + `ActionOutcome::Proxy`) ---
+    // --- resolve_variant / parse_variant_upstream (the seam that
+    // replaces the source's `handle()` + `ActionOutcome::Proxy`) ---
 
     #[test]
     fn resolve_variant_prefers_sticky_cookie_over_random_pick() {

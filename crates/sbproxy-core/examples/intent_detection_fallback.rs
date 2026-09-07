@@ -12,7 +12,7 @@
 //! Walks through the two cases [`sbproxy_core::intent_detection::detect_intent_with_source`]
 //! covers, printing which path answered each prompt:
 //!
-//! 1. No hook registered at all - the common OSS case for a deployment
+//! 1. No hook registered at all - the common case for a deployment
 //!    that never wired a classifier sidecar behind `IntentDetectionHook`.
 //! 2. A hook that answers for some prompts and declines (fail-open) for
 //!    others, matching how a sidecar-backed hook behaves when it is
@@ -58,7 +58,7 @@ impl IntentDetectionHook for PartialHook {
 
 #[tokio::main]
 async fn main() {
-    println!("--- No hook registered (the common OSS case) ---");
+    println!("--- No hook registered (the common case) ---");
     for prompt in PROMPTS {
         let (category, source) = detect_intent_with_source(None, prompt).await;
         println!("{source:>9} -> {category:?}  {prompt:?}");

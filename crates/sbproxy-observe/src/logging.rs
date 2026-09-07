@@ -471,7 +471,7 @@ pub struct StructuredLog {
     /// 16-hex W3C span ID. Absent when emitted outside a span.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
-    /// Tenant / workspace owner. `"default"` in OSS single-tenant mode.
+    /// Tenant / workspace owner. `"default"` in single-tenant mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     /// Origin route key (`hostname` plus path-prefix).

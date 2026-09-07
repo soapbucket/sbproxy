@@ -73,7 +73,7 @@ struct BackendInner {
     /// Time a cache entry is considered fresh.
     cache_ttl: Duration,
     /// `Vault-Namespace` header (HashiCorp Vault Enterprise).
-    /// Optional; absent for OSS deployments.
+    /// Optional; absent for Vault OSS deployments.
     namespace: Option<String>,
 }
 

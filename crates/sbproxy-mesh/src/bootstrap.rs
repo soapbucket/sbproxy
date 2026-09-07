@@ -6,7 +6,7 @@
 //!
 //! The returned [`MeshNode`] is a live handle that bundles the local node id,
 //! the bootstrap-time peer snapshot, and the cluster-wide `DistributedCache`.
-//! Enterprise consumers (semantic cache, rate-limit, etc.) clone the cache
+//! Other consumers (semantic cache, rate-limit, etc.) clone the cache
 //! `Arc` off the handle rather than reconstructing it from the raw peer list.
 
 use std::collections::HashMap;
@@ -387,7 +387,7 @@ pub async fn bootstrap(
         }
         Err(e) => {
             // Fail-warn: UDP bind failures log and leave `MeshNode.gossip_loop`
-            // unset. The rest of the enterprise stack still functions; the
+            // unset. The rest of the stack still functions; the
             // mesh just will not observe peer liveness.
             tracing::warn!(
                 error = %e,

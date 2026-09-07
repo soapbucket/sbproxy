@@ -1,10 +1,9 @@
-//! OSS Confirm-to-AllowWithHeaders bridge.
+//! Confirm-to-AllowWithHeaders bridge.
 //!
-//! Per `docs/policy.md`, OSS routes a
+//! Per `docs/policy.md`, this build routes a
 //! `PolicyDecision::Confirm` through the existing AllowWithHeaders
 //! mechanism with `X-Policy-Confirm: <reason>` stamped on the
-//! response. The enterprise pipeline parks the request before the
-//! bridge fires; OSS never parks. Edge cases:
+//! response. Nothing on this path parks the request. Edge cases:
 //!
 //! - `expires_at` already in the past at decision time -> 410 Deny.
 //! - `webhook_url` blocked by the SSRF guard -> 502 Deny.
@@ -26,7 +25,7 @@ fn plain_confirm_stamps_x_policy_confirm_via_allow_with_headers() {
     assert_eq!(translated.verdict, VerdictTag::Confirm);
     assert!(
         translated.deny.is_none(),
-        "plain Confirm must not deny in OSS"
+        "plain Confirm must not deny in this build"
     );
     assert_eq!(
         headers,
@@ -34,7 +33,7 @@ fn plain_confirm_stamps_x_policy_confirm_via_allow_with_headers() {
             "X-Policy-Confirm".to_string(),
             "manager review required".to_string(),
         )],
-        "OSS bridge stamps the reason on the response header"
+        "the bridge stamps the reason on the response header"
     );
     assert!(state.first_consumed);
 }
@@ -64,9 +63,8 @@ fn ssrf_blocked_webhook_synthesises_502_deny() {
     let mut headers = Vec::new();
     let mut state = ConfirmReducerState::default();
     // Loopback IPs are the canonical SSRF target the guard
-    // refuses; confirms the OSS validation step rejects them at
-    // decision time before the (enterprise) approver flow ever
-    // runs.
+    // refuses; confirms the validation step rejects them at
+    // decision time before the approver flow ever runs.
     let loopback = url::Url::parse("http://127.0.0.1:8080/inbound").expect("static url");
     let translated = translate_plugin_decision(
         PolicyDecision::confirm("review high spend", Some(loopback), None),

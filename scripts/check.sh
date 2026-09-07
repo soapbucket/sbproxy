@@ -472,6 +472,9 @@ fi
 # before it was grouped:
 #
 #   * tracker placeholders, spec citations, env mutation: grep only.
+#   * expect_err on the non-Debug types: awk over the source, plus a
+#     self-test whose fixtures are written into a mktemp sandbox
+#     outside the repository.
 #   * pub-item and unwrap ratchets: python scans over the source plus a
 #     read of their committed baselines; the scanners write nothing.
 #   * NOTICE coverage: `cargo metadata --locked`, which refuses to
@@ -588,6 +591,17 @@ batch_env_mutation() {
   bash "$ROOT/scripts/check-env-mutation.sh"
 }
 
+# CI: ci.yml lint lane, "no expect_err on the non-Debug config and
+# pipeline types" (WOR-2193). awk plus fixtures. `expect_err` and
+# `unwrap_err` print the Ok value, so both need `T: Debug`, and
+# CompiledConfig and CompiledPipeline deliberately have neither. No
+# production code calls them, so the workspace build stays green and
+# only the test-profile compile fails, which cost four gate cycles in
+# one session. Two seconds here instead.
+batch_expect_err_non_debug() {
+  bash "$ROOT/scripts/check-expect-err-non-debug.sh"
+}
+
 # CI: ci.yml lint lane, "no call site hands tract a model directory"
 # (WOR-2694). Pure grep, in two tiers. Nothing may call tract's
 # model_for_path / model_for_read, which parse and translate in one call
@@ -702,6 +716,7 @@ run_batch "read-only source and doc scans" \
   batch_attribute_theft "no insertion landed inside an attribute block" \
   batch_spec_citations "spec citation hygiene" \
   batch_env_mutation "no process-global env mutation outside test helpers" \
+  batch_expect_err_non_debug "no expect_err on the non-Debug config and pipeline types" \
   batch_onnx_model_loaders "no call site hands tract a model directory" \
   batch_durable_file_modes "durable sinks create files owner-only" \
   batch_runtime_image_lockstep "runtime images keep /var/lib/sbproxy and debian13" \

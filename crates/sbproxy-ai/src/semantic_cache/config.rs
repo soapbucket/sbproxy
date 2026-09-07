@@ -245,7 +245,7 @@ pub struct OpenAiEmbeddingConfig {
     pub allow_private_base_url: bool,
 }
 
-/// Operator config for the OSS embedding semantic cache, parsed from an
+/// Operator config for the embedding semantic cache, parsed from an
 /// `ai_proxy` action's `semantic_cache:` block.
 ///
 /// Unknown keys are rejected, so a stale `streaming:` or `key_template:`

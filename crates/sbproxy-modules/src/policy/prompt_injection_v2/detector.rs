@@ -318,9 +318,9 @@ macro_rules! register_prompt_injection_detector {
 
 /// Resolve a detector by name from the inventory registry.
 ///
-/// Returns `None` when no registered factory matches. The OSS build
-/// always registers `heuristic-v1`; enterprise (or follow-up OSS PRs)
-/// register additional names.
+/// Returns `None` when no registered factory matches. This build
+/// always registers `heuristic-v1`; a linked plugin crate can
+/// register additional names via `inventory`.
 pub fn lookup_detector(name: &str) -> Option<std::sync::Arc<dyn Detector>> {
     for entry in inventory::iter::<DetectorFactory> {
         if entry.name == name {

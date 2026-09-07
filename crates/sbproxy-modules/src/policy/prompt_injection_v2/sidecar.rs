@@ -1,14 +1,16 @@
 //! Sidecar-backed detector for `prompt_injection_v2`.
 //!
-//! Routes detection to the out-of-process classifier sidecar over gRPC instead
-//! of running ONNX inference inside the proxy. The sidecar (the minimal OSS one
-//! or the richer enterprise one) implements the shared `InferenceService`; this
-//! detector owns one lazily-connected client and maps its response onto the v2
-//! label vocabulary, reusing the ONNX detector's score cutoffs so the two
-//! report identically. The gRPC channel is built on the first `detect` call,
-//! not at construction: tonic channel creation spawns onto the Tokio runtime
-//! and config-load runs outside one, so building it eagerly panicked the
-//! proxy at boot (WOR-1783).
+//! Routes detection to the out-of-process classifier sidecar over gRPC
+//! instead of running ONNX inference inside the proxy. The sidecar is any
+//! implementation of the shared `InferenceService` contract; this
+//! workspace builds two, `sbproxy-classifier-sidecar` (minimal) and
+//! `sbproxy-classifier` (rich), and this detector owns one
+//! lazily-connected client and maps its response onto the v2 label
+//! vocabulary, reusing the ONNX detector's score cutoffs so the two report
+//! identically. The gRPC channel is built on the first `detect` call, not
+//! at construction: tonic channel creation spawns onto the Tokio runtime and
+//! config-load runs outside one, so building it eagerly panicked the proxy
+//! at boot (WOR-1783).
 //!
 //! Response validation lives in the client (`validate_classify_response` in
 //! `sbproxy-classifier-client`): a structurally malformed sidecar response

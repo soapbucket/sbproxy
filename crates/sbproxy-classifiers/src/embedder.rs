@@ -3,7 +3,7 @@
 //!
 //! Mirrors [`crate::OnnxClassifier`]'s loader, size-budget, and cache
 //! conventions but produces an L2-normalized mean-pooled sentence vector
-//! instead of a class label. Used by the OSS classifier sidecar's `Embed`
+//! instead of a class label. Used by the classifier sidecars' `Embed`
 //! RPC and by the in-process embedding option for the AI gateway semantic
 //! cache. Runs on pure-Rust `tract`, so it cross-compiles and air-gaps the
 //! same way the classifier does.

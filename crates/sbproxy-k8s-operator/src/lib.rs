@@ -1,4 +1,4 @@
-//! OSS Kubernetes operator library for sbproxy.
+//! Kubernetes operator library for sbproxy.
 //!
 //! This crate exposes the CRD types ([`SBProxy`] and [`SBProxyConfig`]) and the
 //! reconciliation logic so external tooling (tests, kubectl plugins, the operator

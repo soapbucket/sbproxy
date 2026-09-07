@@ -7,7 +7,7 @@
 //! natural runtime capture point for the **session ledger**: an
 //! append-only, per-tool-call run record that behavioral eval can query
 //! ("which tools, in what order, with what params") instead of parsing a
-//! transcript. The record shape is defined OSS-side in mcptest
+//! transcript. The record shape is defined in mcptest
 //! (`schemas/session-ledger-v1.json`) and is shared so production
 //! traffic and mcptest runs speak one schema.
 //!
@@ -23,7 +23,7 @@
 //!
 //! ## Cost when disabled
 //!
-//! With no sink registered (the OSS default) [`emit_tool_call`] returns
+//! With no sink registered (the default) [`emit_tool_call`] returns
 //! after a single relaxed atomic load, so deployments that do not opt in
 //! pay nothing on the tool-call path.
 
@@ -121,7 +121,7 @@ pub struct LedgerToolCall {
 // --- Sink ---
 
 /// Backend for completed ledger records. `publish` must not block on
-/// I/O; the OSS file sink does a buffered local append, async backends
+/// I/O; the file sink does a buffered local append, async backends
 /// should hand off to a background task and return.
 pub trait SessionLedgerSink: Send + Sync {
     /// Hand a record to the backend. Sinks swallow their own failures;

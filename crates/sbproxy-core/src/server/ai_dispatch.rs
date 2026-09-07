@@ -9831,10 +9831,10 @@ pub(super) async fn handle_ai_proxy(
 
     // --- Prompt classifier hook (fail-open) ---
     //
-    // If the enterprise prompt classifier is wired into the pipeline, call
-    // it here with a best-effort extraction of the last user-visible prompt
-    // text. Any failure (None verdict, panic, transport error) is swallowed
-    // silently: the request continues on the normal path.
+    // If a `PromptClassifierHook` is registered on the pipeline, call it here
+    // with a best-effort extraction of the last user-visible prompt text. Any
+    // failure (None verdict, panic, transport error) is swallowed silently:
+    // the request continues on the normal path.
     //
     // Arc-clone so we release the borrow on `pipeline.hooks` before any
     // await that might need mutable state from the pipeline elsewhere.
@@ -17154,8 +17154,8 @@ pub(super) struct StreamFormatArgs {
 ///
 /// # Stream safety integration
 ///
-/// If the pipeline has a `StreamSafetyHook` wired (enterprise opt-in), a
-/// bidirectional classifier session is opened before any bytes are
+/// If the pipeline has a `StreamSafetyHook` wired (opt-in via a registered
+/// hook), a bidirectional classifier session is opened before any bytes are
 /// forwarded. The safety policy is:
 ///
 /// * **Session start: FAIL-CLOSED.** If `start_session` returns `None`,
@@ -19240,12 +19240,12 @@ async fn relay_ai_stream_frames(
     // --- Start safety session (fail-closed on None) ---
     //
     // Gating on `hooks.stream_safety.is_some()` ties this feature to
-    // enterprise opt-in. When the enterprise classifier is not linked
-    // the hook is absent and streaming runs in its original, unchanged
-    // path. Per-origin rule subsetting: read the origin's
-    // `stream_safety` list and only start a session when the origin
-    // declared at least one rule. Empty list = no safety enforcement
-    // for this origin even when the hook is wired (operator opt-out).
+    // opt-in via a registered hook. When no classifier hook is linked the
+    // hook is absent and streaming runs in its original, unchanged path.
+    // Per-origin rule subsetting: read the origin's `stream_safety` list
+    // and only start a session when the origin declared at least one rule.
+    // Empty list = no safety enforcement for this origin even when the
+    // hook is wired (operator opt-out).
     let origin_rules: Vec<String> = origin_idx
         .and_then(|idx| pipeline.config.origins.get(idx))
         .map(|o| o.stream_safety.clone())

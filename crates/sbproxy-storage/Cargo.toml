@@ -10,7 +10,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Storage abstraction (ephemeral KV, persistent KV, set, pub/sub) with a Redis backend, shared by the OSS mesh and the dynamic key plane."
+description = "Storage abstraction (ephemeral KV, persistent KV, set, pub/sub) with a Redis backend, shared by the mesh and the dynamic key plane."
 
 [features]
 default = ["redis"]

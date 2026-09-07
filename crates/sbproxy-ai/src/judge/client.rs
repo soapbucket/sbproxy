@@ -104,8 +104,8 @@ impl JudgeClient {
     }
 
     /// Build a client around already-allocated cache and budget
-    /// instances. Used by the tests, and by future enterprise wiring
-    /// that swaps the cache for a Redis-backed implementation.
+    /// instances. Used by the tests, and by any caller that wants to
+    /// share one cache or budget across several clients.
     pub fn with_components(
         config: JudgeConfig,
         cache: Arc<JudgeCache>,

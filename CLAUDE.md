@@ -24,6 +24,7 @@ ten-minute build.
 | Attribute theft (diff-scoped) | `python3 scripts/check-attribute-theft.py --check` |
 | Spec citations | `bash scripts/check-spec-citations.sh` |
 | Env mutation | `bash scripts/check-env-mutation.sh` |
+| expect_err on non-Debug types | `bash scripts/check-expect-err-non-debug.sh` |
 | Durable file modes | `bash scripts/check-durable-file-modes.sh` |
 | Secret-bearing Debug registry | `bash scripts/check-secret-debug-registry.sh` |
 | NOTICE (Apache-2.0-only) | `bash scripts/check-notice.sh` |

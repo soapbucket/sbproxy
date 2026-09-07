@@ -1,7 +1,7 @@
 //! Prometheus metrics for the mesh crate.
 //!
 //! All metrics register on the global default Prometheus registry so they
-//! flow through the existing enterprise metrics exposition automatically.
+//! flow through the existing metrics exposition automatically.
 //! Names use a `mesh_*` prefix to group them separately from the semantic
 //! cache (`semcache_*`) and the AI gateway (`sbproxy_ai_*`).
 //!

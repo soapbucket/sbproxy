@@ -2,7 +2,7 @@
 //
 //! Classifier Judge gRPC service.
 //!
-//! The OSS Judge RPC is the gRPC version of
+//! The Judge RPC is the gRPC version of
 //! [`sbproxy_ai::judge::JudgeClient::semantic`]. The handler owns no
 //! upstream state of its own: it borrows a single process-wide
 //! [`JudgeClient`] (which already holds the upstream HTTP client, the
@@ -69,7 +69,7 @@ pub mod proto {
     tonic::include_proto!("sbproxy.classifier.judge.v1");
 }
 
-/// Configuration block for the OSS Classifier Judge RPC service.
+/// Configuration block for the Classifier Judge RPC service.
 ///
 /// Maps directly to [`JudgeConfig`] but accepts deserialised TOML /
 /// YAML field types so a host crate can plumb this into its config

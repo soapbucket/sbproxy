@@ -76,7 +76,7 @@ impl Detector for HeuristicDetector {
     }
 }
 
-/// Inventory factory for the OSS heuristic detector.
+/// Inventory factory for the built-in heuristic detector.
 fn heuristic_factory() -> Arc<dyn Detector> {
     Arc::new(HeuristicDetector::new())
 }

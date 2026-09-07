@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     /// A deployment that never called `install_egress_refused_hook` at
-    /// all (the OSS default, or any process that boots before
+    /// all (the default, or any process that boots before
     /// `sbproxy-core`'s registration line runs) must not panic on a
     /// refusal. This is the sibling of the test above and deliberately
     /// does not install a hook itself; nextest gives it its own

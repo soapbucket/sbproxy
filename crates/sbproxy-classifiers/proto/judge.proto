@@ -15,7 +15,7 @@ syntax = "proto3";
 
 package sbproxy.classifier.judge.v1;
 
-// Classifier Judge service. A thin gRPC fronting for the OSS
+// Classifier Judge service. A thin gRPC fronting for the
 // `JudgeClient`. Authentication, tenancy, and transport security are
 // expected to terminate before this service.
 service Judge {
@@ -60,7 +60,7 @@ message JudgeResponse {
   }
 
   // Human readable reason. Same string used in telemetry and in the
-  // OSS `X-Policy-Confirm` header for confirm verdicts.
+  // `X-Policy-Confirm` header for confirm verdicts.
   string reason = 5;
   // True when the verdict came from the in-process LRU cache. The
   // server's budget tracker is NOT charged on a cache hit.
@@ -104,10 +104,10 @@ message Header {
   string value = 2;
 }
 
-// Payload for `VERDICT_CONFIRM`. The OSS dispatcher routes confirm
-// verdicts through the `AllowWithHeaders` mechanism; the enterprise
-// interceptor parks the request and uses these fields to drive the
-// approval portal.
+// Payload for `VERDICT_CONFIRM`. The policy dispatcher routes confirm
+// verdicts through the `AllowWithHeaders` mechanism and does not park the
+// request; these fields are carried for a hook that does park, such as the
+// Cedar MCP `approval:` flow driving the approval portal.
 message ConfirmVerdict {
   // Summary of why approval is required.
   string reason = 1;

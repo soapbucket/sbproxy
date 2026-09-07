@@ -481,6 +481,17 @@ jobs:
       - name: no process-global env mutation outside test helpers
         run: bash scripts/check-env-mutation.sh
 
+      # `expect_err` and `unwrap_err` print the Ok value on the wrong
+      # branch, so both require `T: Debug`. CompiledConfig and
+      # CompiledPipeline deliberately have none: they hold compiled
+      # credentials and key material. No production code calls either
+      # method on them, so `cargo build --workspace` is green and only
+      # the test-profile compile fails, which cost four gate cycles in
+      # one session (WOR-2193). Two seconds here instead of a build.
+      # Shares one script with scripts/check.sh.
+      - name: no expect_err on the non-Debug config and pipeline types
+        run: bash scripts/check-expect-err-non-debug.sh
+
       # No call site hands tract a model directory (WOR-2694).
       # model_for_path parses and translates in one call and hands tract
       # the model's directory, which is what GHSA-h668-6x6g-f8r5

@@ -11,7 +11,7 @@ sbproxy-config.workspace = true
 # HTTP method enum for emitting per-method operations
 http.workspace = true
 
-# Plugin registry for enterprise-supplied auth scheme mappers
+# Plugin registry for auth scheme mappers supplied by a linked plugin crate
 inventory.workspace = true
 
 # Serialization

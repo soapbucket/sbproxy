@@ -17,7 +17,7 @@
 //!
 //! The fetch path is `async`, so callers that resolve a
 //! `Signature-Agent` header must be on a Tokio runtime. Static
-//! callers (the OSS default `bot_auth` policy with an inline agent
+//! callers (the default `bot_auth` policy with an inline agent
 //! list) keep the synchronous verification path untouched and pay
 //! no async cost.
 

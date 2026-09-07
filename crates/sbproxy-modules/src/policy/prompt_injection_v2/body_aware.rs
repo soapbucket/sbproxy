@@ -1,6 +1,6 @@
 //! Body-aware prompt-injection detection for the AI hot path.
 //!
-//! The OSS scaffold scans the request URI and non-auth headers at
+//! The scaffold scans the request URI and non-auth headers at
 //! request-filter time. The body of an `ai_proxy` request typically
 //! carries the prompt itself, which means the URI scan misses the
 //! actual attack surface for AI traffic. The body-aware path bridges

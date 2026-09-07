@@ -1361,7 +1361,7 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // is absent), then install it in the global slot the request
     // pipeline reads in `request_filter`. `builtin` and `inline` are
     // live. The compatibility values `hosted-feed` and `merged` warn
-    // and use the embedded defaults; the OSS runtime does not fetch or
+    // and use the embedded defaults; this runtime does not fetch or
     // validate the reserved `hosted_feed` block. All paths are
     // infallible so an unsupported selection does not block serving.
     #[cfg(feature = "agent-class")]
@@ -2227,7 +2227,7 @@ fn reload_compiled_config_locked(
     // registry on the pipeline. The projection layer reads
     // `pipeline.listings` and renders the per-Listing Agent Skills
     // surface for the well-known endpoints. Load errors are logged
-    // at warn level and the registry stays empty; the OSS surface
+    // at warn level and the registry stays empty; the surface
     // continues to serve the top-level `agent_skills:` block.
     {
         let repo_root = config_dir.to_path_buf();
@@ -7620,7 +7620,7 @@ origins:
 /// Runs after the lifecycle hook has installed its backends, because
 /// that is the only point at which the full set of cache surfaces is
 /// known. The in-tree defaults are all memory-only, so this is a no-op
-/// for every OSS build; it exists so that the day a persistent or
+/// for every build; it exists so that the day a persistent or
 /// replicated backend is wired in, an operator hears about it at boot
 /// instead of finding prompts on disk later.
 ///
@@ -7759,7 +7759,7 @@ mod at_rest_posture_tests {
     #[test]
     fn the_default_memory_only_posture_passes() {
         // Every in-tree implementation inherits this, so the check must be
-        // a no-op for an OSS build.
+        // a no-op for this build.
         let pipeline = pipeline_with_surface("test surface", AtRestPosture::memory_only());
         assert!(enforce_cache_at_rest_posture(&pipeline).is_ok());
     }

@@ -1156,9 +1156,8 @@ pub struct RequestContext {
     pub classifier_intent: Option<IntentCategory>,
     /// Extension map for future verdict-style producers (PII scanners,
     /// language detection, semantic-cache scores, ...). Keys are free-form
-    /// namespaces (e.g. "enterprise.pii", "enterprise.language"). Values
-    /// are arbitrary JSON so new producers can ship without widening this
-    /// struct.
+    /// namespaces (e.g. "plugin.pii", "plugin.language"). Values are arbitrary
+    /// JSON so new producers can ship without widening this struct.
     pub classifier_extensions: HashMap<String, serde_json::Value>,
 
     // --- P0 envelope dimensions ---
@@ -1190,7 +1189,7 @@ pub struct RequestContext {
     /// Minted alongside the existing UUID-based [`Self::request_id`]
     /// at request entry; the UUID stays for backward-compatible
     /// correlation headers, the ULID feeds the typed envelope which
-    /// the enterprise ingest pipeline consumes verbatim.
+    /// the configured ingest sink consumes verbatim.
     pub envelope_request_id: Option<Ulid>,
     /// T1.3 properties echo. When `true`, `response_filter` stamps
     /// every captured property back as `X-Sb-Property-<key>` response
@@ -1228,7 +1227,7 @@ pub struct RequestContext {
 
     // --- Wave 5 / G5.1 KYA verifier side-channel ---
     //
-    // Populated by an `IdentityResolverHook` (typically the enterprise
+    // Populated by an `IdentityResolverHook` (typically a registered
     // KYA verifier) every time it runs, regardless of whether the
     // verifier produced an `agent_id`. A token presented but rejected
     // (`expired`, `revoked`, ...) leaves `agent_id = None` here but
@@ -1236,7 +1235,7 @@ pub struct RequestContext {
     // `request.kya.verdict != "missing"` style gates without owning
     // the verifier.
     //
-    // `None` means the KYA hook never ran (no enterprise binary, or
+    // `None` means the KYA hook never ran (no hook registered, or
     // the operator has not configured KYA in `sb.yml`).
     /// KYA verdict label as exposed to CEL / Lua / JS / WASM under
     /// `request.kya.verdict`.
@@ -1702,7 +1701,7 @@ pub struct RequestContext {
 
     // --- Wave 5 / G5.3 TLS fingerprint ---
     //
-    // Current OSS runtime capture comes from trusted sidecar headers
+    // Current runtime capture comes from trusted sidecar headers
     // because Pingora 0.8 + rustls does not expose raw ClientHello
     // bytes to the request/session API. A future native listener hook
     // should populate this from [`sbproxy_tls::parse_client_hello`].
@@ -1836,7 +1835,7 @@ pub struct RequestContext {
     // --- WOR-201 PR 1b: plugin-policy response header injection ---
     /// Response headers contributed by `Policy::Plugin` enforcers
     /// returning [`sbproxy_plugin::PolicyDecision::AllowWithHeaders`]
-    /// (or the OSS Confirm bridge that translates `Confirm` into
+    /// (or the Confirm bridge that translates `Confirm` into
     /// `AllowWithHeaders` with `X-Policy-Confirm` stamped per
     /// `docs/policy.md`). Drained in
     /// `response_filter`. Empty by default; appended onto the
@@ -2268,7 +2267,7 @@ impl RequestContext {
 
     /// Look up a free-form classifier extension value by key.
     ///
-    /// Callers should namespace keys (e.g. `"enterprise.pii"`) so the
+    /// Callers should namespace keys (e.g. `"plugin.pii"`) so the
     /// map stays collision-free as more producers land.
     pub fn classifier_extension(&self, key: &str) -> Option<&serde_json::Value> {
         self.classifier_extensions.get(key)

@@ -62,8 +62,8 @@ pub struct ConfigFile {
     /// default catalog (so per-agent metric labels keep firing);
     /// operators set this block to provide an inline catalog or change
     /// the rDNS / bot-auth / cache settings. Hosted-feed fields remain
-    /// parseable for compatibility but are not fetched by the OSS
-    /// runtime.
+    /// parseable for compatibility but the runtime does not fetch
+    /// them.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: top-level workspace rate-limit budget + auto-suspend
@@ -292,9 +292,9 @@ mod update_config_tests {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitsConfig {
-    /// Budget applied to the default workspace (the only workspace in
-    /// the OSS single-tenant build; enterprise multi-tenant resolves a
-    /// per-tenant budget).
+    /// Budget applied to every workspace. There is no per-workspace
+    /// override: the registry builds one budget from this block and
+    /// tracks each workspace's usage against it.
     #[serde(default)]
     pub workspace_default: WorkspaceBudgetConfig,
     /// Throttle -> auto-suspend escalation tuning.
@@ -1335,7 +1335,7 @@ pub struct AgentClassesConfig {
     /// Catalog source. `builtin` (default) loads the embedded YAML and
     /// `inline` loads `entries`. The compatibility values `hosted-feed`
     /// and `merged` currently warn and fall back to the embedded
-    /// defaults; the OSS runtime does not fetch `hosted_feed.url`.
+    /// defaults; the runtime does not fetch `hosted_feed.url`.
     #[serde(default = "default_agent_classes_catalog")]
     pub catalog: String,
     /// Inline catalog entries. Used when `catalog: inline`; each entry
@@ -1344,7 +1344,7 @@ pub struct AgentClassesConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<serde_json::Value>,
     /// Compatibility-only hosted-feed configuration. It remains
-    /// parseable but the OSS runtime does not fetch or merge it.
+    /// parseable but the runtime does not fetch or merge it.
     #[serde(default)]
     pub hosted_feed: Option<HostedFeedConfig>,
     /// Resolver tuning (rDNS toggle, bot-auth toggle, cache size).
@@ -1371,17 +1371,17 @@ fn default_agent_classes_catalog() -> String {
 /// Hosted-feed source for the agent-class catalog.
 ///
 /// Reserved so YAML written against the `hosted-feed` or `merged`
-/// shapes parses cleanly. The OSS runtime does not fetch, refresh, or
+/// shapes parses cleanly. The runtime does not fetch, refresh, or
 /// verify this feed; selecting either catalog value warns and falls
 /// back to the embedded defaults.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostedFeedConfig {
     /// Reserved feed URL. It is accepted but not fetched or validated
-    /// by the OSS runtime.
+    /// by the runtime.
     pub url: String,
     /// Reserved bootstrap public keys. They are accepted but no
-    /// signature verification is installed in the OSS runtime.
+    /// signature verification is installed in the runtime.
     #[serde(default)]
     pub bootstrap_keys: Vec<String>,
 }
@@ -4821,7 +4821,7 @@ pub struct KeyGovernanceConfig {
     /// be pre-gated must not be silently treated as unlimited.
     #[serde(default)]
     pub missing_rate: GovernanceMissingRatePolicy,
-    /// Reserved caller-introspection switch. The OSS runtime does not install
+    /// Reserved caller-introspection switch. The runtime does not install
     /// `GET /api/v1/key`; retained for config compatibility.
     pub key_introspection: bool,
     /// Require AI requests to resolve to a governed key instead of accepting
@@ -10257,7 +10257,7 @@ pub struct CredentialBudget {
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
     /// Reserved reset-window hint. It is accepted but not parsed or
-    /// enforced by the OSS runtime.
+    /// enforced by the runtime.
     #[serde(default)]
     pub reset: Option<String>,
 }
@@ -11645,7 +11645,7 @@ pub struct HeaderModifiers {
 ///
 /// The live surface is [`SecretsConfig::backends`], selected by provider URI
 /// references. The legacy single-backend and rotation fields remain parseable
-/// for compatibility but are not consumed by the OSS runtime.
+/// for compatibility but are not consumed by the runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
@@ -12061,7 +12061,7 @@ pub enum K8sBackendAuth {
 
 /// Legacy HashiCorp Vault connection settings.
 ///
-/// The OSS resolver consumes the `hashicorp` variant in
+/// The resolver consumes the `hashicorp` variant in
 /// [`SecretsConfig::backends`], not this compatibility block.
 #[derive(Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]

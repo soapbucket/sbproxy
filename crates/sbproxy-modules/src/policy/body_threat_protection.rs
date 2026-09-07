@@ -3,7 +3,7 @@
 //!
 //! Kong gates the equivalent capability (its JSON Threat Protection
 //! and XML Threat Protection plugins) behind its Enterprise tier;
-//! SBproxy ships it in OSS. The policy is shape enforcement, not
+//! SBproxy ships it by default. The policy is shape enforcement, not
 //! signature matching: it bounds nesting depth, container sizes, and
 //! string lengths, and it refuses XML DTDs outright, which is what
 //! kills the billion-laughs entity-expansion class. Because the

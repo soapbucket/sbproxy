@@ -7,7 +7,7 @@
 //!
 //! [`CompAuthorization::Cap`] and [`CompAuthorization::Olp`] name the
 //! two credential types a tier can require. Both already have a full
-//! OSS implementation elsewhere in the workspace: CAP verification in
+//! implementation elsewhere in the workspace: CAP verification in
 //! `crates/sbproxy-modules/src/auth/cap.rs`, OLP issuance and
 //! verification in `crates/sbproxy-modules/src/olp.rs`. This crate
 //! does not re-implement either; a tier tagged `Cap` is manifest
@@ -120,7 +120,8 @@ pub struct CompPublisher {
 pub enum CompAuthorization {
     /// Public access. No token required.
     Public,
-    /// CAP token required. Verified OSS-side; see module docs.
+    /// CAP token required. Verified elsewhere in this workspace;
+    /// see module docs.
     Cap,
     /// OLP license token required. This is the only variant
     /// [`super::marketplace::CompMarketplace::redeem`] can currently

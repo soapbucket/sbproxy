@@ -19,7 +19,7 @@
 //! See `2026-04-23-mesh-redis-hybrid-design.md` §5.3-§5.5 and
 //! `MESH_V1_RESULTS.md` §7.4 for the design rationale.
 //!
-//! This module is an integration seam, not OSS runtime surface: the OSS
+//! This module is an integration seam, not default runtime surface: the
 //! bootstrap never constructs a federation loop. It attaches only through
 //! [`MeshNode::with_federation`](crate::node_handle::MeshNode::with_federation),
 //! which a pipeline lifecycle extension calls after boot.

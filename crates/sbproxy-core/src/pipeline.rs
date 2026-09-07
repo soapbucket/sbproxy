@@ -1125,7 +1125,7 @@ impl CacheReserveBackend for ObservedCacheReserve {
     }
 }
 
-/// Build the OSS Cache Reserve backend from the YAML config block.
+/// Build the Cache Reserve backend from the YAML config block.
 ///
 /// Returns the optional backend, its admission settings, and a health state
 /// that survives even when construction fails. Failures during construction
@@ -1811,7 +1811,7 @@ impl OriginCacheKeys<'_> {
 
 /// TLS-fingerprint capture mode.
 ///
-/// `passive` and `sidecar` are wire-equivalent today; the OSS path
+/// `passive` and `sidecar` are wire-equivalent today; this path
 /// captures fingerprints exclusively from the sidecar header pattern
 /// because Pingora 0.8 does not surface the raw ClientHello bytes. The
 /// distinct names are reserved so a future native-capture implementation
@@ -2305,6 +2305,23 @@ impl McpInjectRegistry {
 ///
 /// Each vec is parallel to `config.origins` - index N in `actions` corresponds
 /// to index N in `config.origins`. This avoids per-request JSON parsing.
+///
+/// # No `Debug`, by design
+///
+/// This type holds the compiled credentials and key material its
+/// modules were built from, so it carries no `Debug` and gets no
+/// blanket derive to satisfy a caller that wants to print it, for the
+/// same reason [`sbproxy_config::CompiledConfig`] does not.
+///
+/// So `Result::expect_err` and `Result::unwrap_err`, which print the
+/// `Ok` value on the wrong branch and therefore require `T: Debug`, do
+/// not compile on a `Result<CompiledPipeline, _>`. Production never
+/// calls them, so the workspace build stays green and only the test
+/// profile fails. A test asserting on a refusal writes
+/// `.err().expect("...")` instead. Do not carry that form to a type
+/// that does implement `Debug`: `clippy::err_expect` refuses it there.
+/// `scripts/check-expect-err-non-debug.sh` holds the line for both
+/// types in seconds rather than behind a build.
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
@@ -3967,7 +3984,7 @@ impl CompiledPipeline {
 
         // --- Cache Reserve cold tier ---
         //
-        // Built from the top-level `cache_reserve:` block. The OSS
+        // Built from the top-level `cache_reserve:` block. The built-in
         // backends (memory / filesystem / redis / object-store / s3) are
         // instantiated here; unknown or extension-provided backends drop
         // through to `None` with a warning so a pipeline lifecycle hook can

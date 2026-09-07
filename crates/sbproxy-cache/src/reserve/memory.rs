@@ -2,8 +2,8 @@
 //!
 //! Backed by a [`DashMap`]. Intended for tests and ephemeral
 //! single-replica workloads; production deployments should pick the
-//! filesystem or Redis backend (or an enterprise object-store
-//! backend) so the reserve survives restarts.
+//! filesystem, Redis, or object-store backend so the reserve
+//! survives restarts.
 
 use std::time::SystemTime;
 

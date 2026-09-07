@@ -1,12 +1,10 @@
 //! LLM-as-judge backend (single-provider, BYOK).
 //!
-//! Implements the OSS slice of the judge surface defined in
-//! `docs/policy.md`. The host function `judge::semantic`
-//! takes a prompt template plus a JSON payload and returns a
-//! [`PolicyDecision`](sbproxy_plugin::PolicyDecision). The OSS
-//! backend is a single configurable provider; the enterprise router
-//! (multi-provider failover, Redis cache, calibration tracker) lives
-//! outside this crate.
+//! Implements the judge surface defined in `docs/policy.md`. The
+//! host function `judge::semantic` takes a prompt template plus a
+//! JSON payload and returns a
+//! [`PolicyDecision`](sbproxy_plugin::PolicyDecision), backed by a
+//! single configurable provider.
 //!
 //! Public surface:
 //!
@@ -18,8 +16,8 @@
 //! - [`JudgeError`] - failure modes the caller must convert into
 //!   `PolicyDecision::Deny` (or surface to telemetry).
 //! - [`JudgeCache`] - LRU keyed on `(prompt_hash, payload_hash)`,
-//!   exposed publicly so the enterprise crate can wrap it with a
-//!   Redis layer without re-implementing the LRU.
+//!   exposed publicly so it can be wrapped or replaced with a
+//!   Redis-backed store without re-implementing the LRU.
 //!
 //! The cache key is a pair of `u128` values, each the leading 128
 //! bits of `SHA-256(text)`. Cache hits skip the model call entirely

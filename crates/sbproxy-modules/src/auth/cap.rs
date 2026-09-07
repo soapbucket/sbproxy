@@ -1,9 +1,9 @@
 //! Crawler Authorization Protocol (CAP) verifier.
 //!
-//! Implements the OSS-side verifier for the CAP token format. Token
-//! issuance lives in a separate component; verification is the
-//! OSS side because it is the latency-critical path that runs on
-//! every request.
+//! Implements the verifier for the CAP token format. Token
+//! issuance lives in a separate component; verification lives in
+//! this crate because it is the latency-critical path that runs
+//! on every request.
 //!
 //! The verifier:
 //!
@@ -92,7 +92,7 @@ pub struct CapRateLimitInfo {
 
 /// Verdict produced by [`CapVerifier::verify`].
 ///
-/// The closed set mirrors the OSS verifier failure modes.
+/// The closed set mirrors this verifier's failure modes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CapVerdict {
     /// The token verified end-to-end. Carries the typed view for
@@ -186,8 +186,10 @@ impl CapError {
 ///
 /// One of `jwks_url` or `jwks_static` MUST be set. `jwks_url` is the
 /// production path; `jwks_static` is the offline / pre-issued-token
-/// deployment shape described in the ADR's "Issuance (enterprise)"
-/// closing paragraph.
+/// deployment shape described under "Honest limits" in
+/// `docs/cap.md`: this gateway verifies tokens and does not mint
+/// them, so a deployment pre-issues with its own tooling and hands
+/// over only the public keys.
 ///
 /// WOR-2181: unknown keys are refused, so `require_agent_bindng: true`
 /// fails the config instead of leaving an unbound token acceptable.

@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 fn load_example() -> sbproxy_config::CompiledConfig {
-    // Locate the canonical OSS example via a path relative to this
+    // Locate the canonical example via a path relative to this
     // crate's manifest so the test works regardless of cargo's working
     // directory.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let example = manifest.join("../../examples/openapi-emission/sb.yml");
     if !example.exists() {
-        // The example is part of the OSS tree; if it is missing in a
+        // The example is part of the repo tree; if it is missing in a
         // partial checkout we skip rather than fail.
         return sbproxy_config::CompiledConfig::default();
     }

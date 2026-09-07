@@ -77,8 +77,8 @@
 //!   in one map under one mutex, so the claim is atomic by
 //!   construction.
 //! - `KvIdempotencyCache` for Redis-backed deployments. It wraps any
-//!   `sbproxy_platform::storage::KVStore` impl, which keeps the OSS
-//!   build redis-client-agnostic (the platform crate already pulls
+//!   `sbproxy_platform::storage::KVStore` impl, which keeps this
+//!   crate redis-client-agnostic (the platform crate already pulls
 //!   in the redis driver behind a feature flag and exposes the
 //!   resulting blobs through the unified `KVStore` trait). One store
 //!   serves the whole cluster, so this backend namespaces every key on

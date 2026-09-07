@@ -887,8 +887,8 @@ pub fn plan(baseline: &ConfigFile, proposed: &ConfigFile) -> PlanReport {
 /// Diff two parsed config files and run plan-time semantic
 /// validation with the supplied [`ValidationOptions`]. Use this
 /// entry point in builds that link auth / action / policy /
-/// transform plugin crates beyond the OSS catalog so the unknown-type
-/// rule does not falsely flag those module names.
+/// transform plugin crates beyond the built-in catalog so the
+/// unknown-type rule does not falsely flag those module names.
 pub fn plan_with_options(
     baseline: &ConfigFile,
     proposed: &ConfigFile,

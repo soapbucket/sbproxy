@@ -478,10 +478,10 @@ impl RateLimitPolicy {
 
     /// Attach an observer closure called after every successful L2
     /// counter increment (both async and sync paths). Designed for
-    /// the mesh persistence `SharedState` pattern: the enterprise
-    /// startup hook creates a closure that pushes the post-increment
-    /// count into the shared CRDT, so snapshots to Redis reflect
-    /// real rate-limit state instead of placeholder empties.
+    /// the mesh persistence `SharedState` pattern: a startup hook
+    /// creates a closure that pushes the post-increment count into
+    /// the shared CRDT, so snapshots to Redis reflect real
+    /// rate-limit state instead of placeholder empties.
     ///
     /// Pass `None` to clear a previously attached observer. Observer
     /// closures must be cheap, since they run on the request-hot path.
@@ -735,7 +735,7 @@ impl RateLimitPolicy {
     ///
     /// If the Redis call fails, the request is admitted (fail-open). The
     /// alternative (fail-closed) would turn a Redis hiccup into a
-    /// cluster-wide outage. The Go OSS proxy makes the same choice.
+    /// cluster-wide outage. The archived Go line made the same choice.
     pub async fn allow_with_info_async(&self, client_id: &str) -> RateLimitInfo {
         // Prefer the async store (no spawn_blocking overhead). Fall back
         // to the sync store via spawn_blocking for callers that have not
@@ -775,7 +775,7 @@ impl RateLimitPolicy {
         let key_bytes = key.into_bytes();
 
         // Fail-open helper: Redis hiccups should not turn into a
-        // cluster-wide outage. Matches the Go OSS proxy's choice.
+        // cluster-wide outage. Matches the archived Go line's choice.
         let fail_open = || RateLimitInfo {
             allowed: true,
             limit,

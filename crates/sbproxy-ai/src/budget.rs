@@ -1435,10 +1435,10 @@ pub enum AiUsage {
 /// request.
 ///
 /// The event is published onto the observability bus and consumed by
-/// any number of sinks: the OSS budget tracker (which enforces token
+/// any number of sinks: the budget tracker (which enforces token
 /// limits and audio-second caps for the enforceable units), the
-/// enterprise billing pipeline (which records chargeback rows), and
-/// audit log targets.
+/// chargeback tracker (which records chargeback rows), and audit log
+/// targets.
 ///
 /// `occurred_at_unix_secs` is a UTC Unix timestamp so the shape is
 /// JSON-serializable across the observability bus without leaking

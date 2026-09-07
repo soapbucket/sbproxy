@@ -1,12 +1,12 @@
 //! Page Shield: client-side script monitoring via CSP report intake.
 //!
-//! The policy stamps a Content Security Policy header on every response
-//! and points the `report-uri` / `report-to` directive at a proxy-local
-//! intake endpoint (`/__sbproxy/csp-report` by default). Browser-emitted
+//! The policy stamps a Content Security Policy header on every response and
+//! points the `report-uri` / `report-to` directive at a proxy-local intake
+//! endpoint (`/__sbproxy/csp-report` by default). Browser-emitted
 //! violation reports land back at the gateway, which fans them out as
-//! `policy_denied` events on the OSS event bus. Enterprise builds layer
-//! a connection-monitor analyser on top of the same intake surface
-//! (F3.20) without changing the data plane.
+//! `policy_denied` events on the event bus. A configured `events:` sink
+//! can build further analysis, such as connection-level monitoring, on top
+//! of the same intake surface without changing the data plane.
 
 use serde::Deserialize;
 

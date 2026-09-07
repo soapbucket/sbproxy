@@ -7,12 +7,12 @@
 //! There is no network fetch and no HMAC verification: the rules ship
 //! with the binary, so they are trusted by provenance, not by signature.
 //!
-//! Keeping this distinct from the signed feed matters. The feed is the
-//! enterprise distribution channel (a publisher signs revisions, OSS
-//! subscribers verify and hot-load them). The managed bundle is the
-//! batteries-included OSS baseline: turn it on and a curated CRS-derived
-//! corpus is live, no publisher required. Operators can run either, both,
-//! or neither.
+//! Keeping this distinct from the signed feed matters. The feed is a
+//! live externally-published channel (a publisher signs revisions, this
+//! subscriber verifies and hot-loads them). The managed bundle is the
+//! batteries-included baseline: turn it on and a curated CRS-derived
+//! corpus is live, no publisher required. Operators can run either,
+//! both, or neither.
 //!
 //! Each rule carries an OWASP CRS-style paranoia tag (1-4). The WAF
 //! policy's `paranoia` level gates which bundle rules run, exactly as it

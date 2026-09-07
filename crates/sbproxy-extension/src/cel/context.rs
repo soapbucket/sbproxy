@@ -376,17 +376,17 @@ pub struct KyaVerdictView<'a> {
 }
 
 /// Populate the `request.kya` namespace with the verdict produced by
-/// the enterprise KYA verifier.
+/// the KYA verifier.
 ///
 /// CEL expressions read `request.kya.verdict` (string) to gate routes
 /// without owning the verifier itself. The pipeline calls this once
 /// per request after the resolver chain runs; downstream policy
 /// evaluation reads through the same map.
 ///
-/// When the KYA hook never ran (no enterprise binary, or no
-/// `auth.kya:` block), every field renders as the zero value so a
-/// policy expression like `request.kya.verdict != "missing"` evaluates
-/// to `true` (the expression sees `""` rather than the literal
+/// When the KYA hook never ran (no `auth.kya:` block configured),
+/// every field renders as the zero value so a policy expression like
+/// `request.kya.verdict != "missing"` evaluates to `true` (the
+/// expression sees `""` rather than the literal
 /// `"missing"`). Operators that want "no hook ran" to count as
 /// "missing" must spell that out: `request.kya.verdict == "missing"`.
 ///
@@ -469,7 +469,7 @@ pub struct MlClassificationView<'a> {
 }
 
 /// Populate the `request.ml_classification` namespace with the verdict
-/// produced by the enterprise ML agent classifier.
+/// produced by the ML agent classifier.
 ///
 /// CEL expressions read:
 ///

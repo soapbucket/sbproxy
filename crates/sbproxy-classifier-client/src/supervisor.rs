@@ -2,7 +2,7 @@
 //!
 //! Pairs with the UDS transport that shipped in WOR-705 part 1. The
 //! supervisor is the zero-extra-ops story for the standalone /
-//! dev / single-pod case: the proxy spawns the OSS sidecar binary
+//! dev / single-pod case: the proxy spawns the sidecar binary
 //! as a child process, supervises it (restart on unexpected exit,
 //! drain on shutdown), and the request path holds a lazy
 //! [`ClassifierClient`] over the same UDS path the supervisor

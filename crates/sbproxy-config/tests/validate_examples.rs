@@ -225,7 +225,7 @@ fn every_oss_example_compiles() {
     if !failures.is_empty() {
         let summary = failures.join("\n  ");
         panic!(
-            "{} of {} OSS example(s) failed to compile:\n  {}",
+            "{} of {} example(s) failed to compile:\n  {}",
             failures.len(),
             files.len(),
             summary

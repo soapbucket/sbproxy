@@ -9,7 +9,7 @@
 //! ```
 //!
 //! The inner JSON is the model's native chunk shape (e.g. an
-//! Anthropic `message_delta` event). For the OSS parser we focus on
+//! Anthropic `message_delta` event). For this parser we focus on
 //! the dominant case (Anthropic via Bedrock). The decoded inner
 //! payload is fed line-by-line into an embedded
 //! [`super::anthropic::AnthropicUsageParser`] so the same max-of

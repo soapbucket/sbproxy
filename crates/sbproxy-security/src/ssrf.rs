@@ -69,7 +69,7 @@
 //! Not pinned. Each is defensible for its own reason, and each is a
 //! place the rebinding window is still open:
 //!
-//! - `sbproxy-core::policy_dispatch`, Confirm webhook target: the OSS
+//! - `sbproxy-core::policy_dispatch`, Confirm webhook target: the
 //!   pipeline never dials it. Validation is a fail-closed decision
 //!   gate, not a pre-dial check.
 //! - `sbproxy-modules::policy::a2a`, `check_push_notification`: the

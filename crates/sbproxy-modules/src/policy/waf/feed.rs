@@ -1,13 +1,13 @@
 //! WAF rule-feed subscriber.
 //!
-//! Hot-loads signed rule bundles published by the enterprise feed
-//! service and exposes the current [`RuleSet`] to the WAF policy
+//! Hot-loads signed rule bundles published by an external feed
+//! publisher and exposes the current [`RuleSet`] to the WAF policy
 //! evaluator via an [`arc_swap::ArcSwap`] snapshot. In-flight requests
 //! see a stable view; updates land atomically.
 //!
 //! # Protocol contract
 //!
-//! The publisher is out of scope for this OSS crate; this module only
+//! The publisher is out of scope for this crate; this module only
 //! consumes the bundle. Two transports are supported:
 //!
 //! ## HTTP polling
@@ -495,7 +495,7 @@ impl WafFeedSubscriber {
     /// Spawn the transport-specific background task once a Tokio
     /// runtime is available. Idempotent: subsequent calls are no-ops.
     /// Called lazily from the WAF request path so the task starts
-    /// inside Pingora's runtime, since OSS config compile runs in a
+    /// inside Pingora's runtime, since config compile runs in a
     /// sync context where `tokio::spawn` would panic.
     pub fn ensure_started(self: &Arc<Self>) {
         if !self.config.enabled {

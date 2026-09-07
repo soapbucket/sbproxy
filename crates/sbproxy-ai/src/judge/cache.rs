@@ -10,9 +10,9 @@
 //! the verdict without touching the upstream provider. Cache hits
 //! charge zero tokens against the [`BudgetTracker`].
 //!
-//! The struct is `pub` so the enterprise crate can wrap or replace
-//! the in-memory backing with a Redis layer for cross-instance
-//! sharing without re-implementing the LRU semantics.
+//! The struct is `pub` so it can be wrapped or replaced (for example
+//! with a Redis-backed store for cross-instance sharing) without
+//! re-implementing the LRU semantics.
 //!
 //! [`BudgetTracker`]: super::BudgetTracker
 

@@ -1,7 +1,8 @@
 //! A real [`crate::hooks::IntentDetectionHook`] backed by the classifier
-//! sidecar (WOR-2661/WOR-2665), closing the gap
-//! `crate::intent_detection`'s module doc used to call out: "no
-//! sidecar-backed implementation ships in this OSS tree today."
+//! sidecar (WOR-2661/WOR-2665). Before it landed there was no
+//! sidecar-backed implementation in the tree at all, and
+//! `crate::intent_detection` had only its local keyword heuristic to
+//! fall back on.
 //!
 //! [`crate::classifier_hooks::ClassifierIntentHook`] wraps
 //! [`sbproxy_classifier_client::FallbackClassifier`], the WOR-2665
@@ -615,7 +616,7 @@ pub struct ClassifierIntentHook {
 
 impl ClassifierIntentHook {
     /// Build a hook that classifies through `sidecar` (`None` runs the
-    /// heuristic on every call, the common OSS case: no sidecar deployed
+    /// heuristic on every call, the common case: no sidecar deployed
     /// at all) using `model` as the sidecar's logical model id for the
     /// `Classify` RPC (empty selects the sidecar's default).
     pub fn new(sidecar: Option<ClassifierClient>, model: impl Into<String>) -> Self {
@@ -1023,7 +1024,7 @@ mod tests {
     /// dead loopback port, exactly the fallback.rs pattern this hook
     /// wraps) degrades to the heuristic rather than returning `None`
     /// outright, so a broken sidecar makes intent detection revert to
-    /// the OSS default instead of going silent.
+    /// the default instead of going silent.
     #[tokio::test]
     async fn unreachable_sidecar_degrades_to_heuristic() {
         // Port 1 is a privileged port nothing in a test sandbox is

@@ -8,7 +8,7 @@
 //! block-versus-admit half of that action; see
 //! [`PromptInjectionV2Policy::action`] for the resolution.
 //!
-//! The OSS build ships heuristic, in-process ONNX, and sidecar
+//! This build ships heuristic, in-process ONNX, and sidecar
 //! detectors. When `detector` is omitted, a complete verified local
 //! artifact pair selects in-process inference; an entirely absent pair
 //! selects the heuristic. Explicit detector names always win. The
@@ -287,7 +287,7 @@ struct RawConfig {
     #[serde(default)]
     detector_config: serde_json::Value,
     /// Run the body-aware scan inside the AI proxy hot path.
-    /// Defaults to `false`: the OSS scaffold remains URI + header
+    /// Defaults to `false`: the scaffold remains URI + header
     /// scanning at request-filter time. When set to `true` and the
     /// origin is wired through `ai_proxy`, the proxy additionally
     /// runs the detector against the parsed prompt body before the
@@ -355,7 +355,7 @@ impl PromptInjectionV2Policy {
     ///
     /// Unknown detector names are a hard error so misconfigured
     /// configs surface at startup rather than the first request. The
-    /// fallback detector is always available because the OSS build
+    /// fallback detector is always available because this build
     /// registers `heuristic-v1`. Omission attempts verified local
     /// in-process selection before using that fallback.
     pub fn from_config(value: serde_json::Value) -> Result<Self> {

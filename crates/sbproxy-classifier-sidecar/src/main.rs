@@ -1,4 +1,4 @@
-//! Minimal OSS classifier sidecar (WOR-704 PR 2).
+//! Minimal classifier sidecar (WOR-704 PR 2).
 //!
 //! Serves the shared `InferenceService` gRPC contract backed by the
 //! `sbproxy-classifiers` tract ONNX engine. Running classification in this
@@ -1117,7 +1117,7 @@ impl InferenceService for SidecarService {
 
 /// CLI for the sidecar.
 #[derive(Parser)]
-#[command(about = "Minimal OSS classifier sidecar serving the InferenceService gRPC contract.")]
+#[command(about = "Minimal classifier sidecar serving the InferenceService gRPC contract.")]
 struct Cli {
     /// TCP address to listen on. Mutually exclusive with
     /// `--listen-uds`; the default is used only when neither flag is

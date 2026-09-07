@@ -14,7 +14,7 @@
 //! |---|---|
 //! | `Ok(Allow)` | `Allow` |
 //! | `Ok(AllowWithHeaders { headers })` | `AllowWithHeaders { headers }` (passthrough) |
-//! | `Ok(Confirm { .. })` | `Confirm { .. }` (passthrough; the OSS dispatcher bridges to `AllowWithHeaders` per the verdict-shape ADR) |
+//! | `Ok(Confirm { .. })` | `Confirm { .. }` (passthrough; the dispatcher bridges to `AllowWithHeaders` per the verdict-shape ADR) |
 //! | `Ok(Deny { .. })` and `violations_block = true` | passthrough Deny |
 //! | `Ok(Deny { .. })` and `violations_block = false` | log + `Allow` (informational mode) |
 //! | `Err(BudgetExhausted)` | `Deny { 429, "judge_budget_exhausted" }` |
@@ -187,9 +187,9 @@ impl SemanticConstraintPolicy {
                 };
             }
         };
-        // Pass an empty payload for the OSS scope; the prompt itself
-        // carries the rendered request shape. The enterprise wiring
-        // forwards the redacted body via sbproxy-security PII redactor.
+        // Pass an empty payload here; the prompt itself carries the
+        // rendered request shape. A follow-up could forward the
+        // redacted body via sbproxy-security's PII redactor instead.
         let payload = serde_json::Value::Object(serde_json::Map::new());
         match self.judge.semantic(&rendered, payload).await {
             Ok(PolicyDecision::Deny { status, message }) => {
@@ -206,7 +206,7 @@ impl SemanticConstraintPolicy {
                 }
             }
             // Allow / AllowWithHeaders / Confirm pass through verbatim;
-            // the OSS dispatcher bridges Confirm to AllowWithHeaders
+            // the dispatcher bridges Confirm to AllowWithHeaders
             // per the verdict-shape ADR. `Confirm` is `#[non_exhaustive]`
             // so we forward the verdict value rather than destructuring
             // and reconstructing it here.
@@ -407,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_with_headers_passes_through() {
-        // The OSS dispatcher bridges Confirm to AllowWithHeaders so
+        // The dispatcher bridges Confirm to AllowWithHeaders so
         // the dispatcher only needs to know about Allow / Deny /
         // AllowWithHeaders shapes. We exercise the AllowWithHeaders
         // passthrough here because `PolicyDecision::Confirm` is

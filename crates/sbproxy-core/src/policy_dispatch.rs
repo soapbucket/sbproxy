@@ -7,11 +7,11 @@
 //!    the rest. The dispatcher in `server.rs` enforces this via
 //!    early `return PolicyResult::Deny(...)` (existing behaviour;
 //!    PR 1b only adds audit emission to the path).
-//! 2. If no `Deny`, the first `Confirm` wins. The OSS bridge
-//!    translates `Confirm` to `AllowWithHeaders` with
-//!    `X-Policy-Confirm: <reason>` stamped; later `Confirm`
-//!    verdicts in the chain are recorded but do not re-stamp the
-//!    header. Tracked via [`crate::policy_dispatch::ConfirmReducerState`].
+//! 2. If no `Deny`, the first `Confirm` wins. The bridge translates
+//!    `Confirm` to `AllowWithHeaders` with `X-Policy-Confirm: <reason>`
+//!    stamped; later `Confirm` verdicts in the chain are recorded but do
+//!    not re-stamp the header. Tracked via
+//!    [`crate::policy_dispatch::ConfirmReducerState`].
 //! 3. `AllowWithHeaders` from any number of policies accumulate
 //!    onto the response header list in chain order. The dispatcher
 //!    threads these through `RequestContext::policy_response_headers`
@@ -21,9 +21,9 @@
 //! Confirm-verdict edge cases per the verdict-shape ADR:
 //!
 //! - `expires_at` already in the past: synthesise a 410 deny.
-//! - `webhook_url` blocked by the SSRF guard: synthesise a 502
-//!   deny so an obviously-bad URL never reaches the (enterprise)
-//!   approver flow. Validation alone is enough; the OSS pipeline
+//! - `webhook_url` blocked by the SSRF guard: synthesise a 502 deny
+//!   so an obviously-bad URL never reaches the approver flow the
+//!   webhook points at. Validation alone is enough; the pipeline
 //!   never actually calls the webhook.
 
 use sbproxy_observe::events::VerdictTag;
@@ -44,7 +44,7 @@ pub struct ConfirmReducerState {
     pub first_consumed: bool,
 }
 
-/// Outcome of a single Plugin policy decision after the OSS
+/// Outcome of a single Plugin policy decision after the
 /// bridge has applied the verdict-shape ADR's edge cases.
 ///
 /// The dispatcher matches on this to either continue the chain
@@ -113,11 +113,11 @@ pub fn translate_plugin_decision(
                 }
             }
             // Edge case 2: webhook_url present. Run through the
-            // SSRF guard at decision time so an obviously-bad URL
-            // never reaches the (enterprise) approver flow. The
-            // OSS pipeline does not actually call the webhook;
-            // validation alone is enough to fail-closed on loops
-            // and private-IP targets.
+            // SSRF guard at decision time so an obviously-bad
+            // URL never reaches the approver flow the webhook
+            // points at. This pipeline does not actually call
+            // the webhook; validation alone is enough to
+            // fail-closed on loops and private-IP targets.
             if let Some(url) = webhook_url.as_ref() {
                 if let Err(reason) = sbproxy_security::ssrf::validate_url(url.as_str()) {
                     tracing::warn!(
@@ -134,10 +134,9 @@ pub fn translate_plugin_decision(
                     };
                 }
             }
-            // OSS bridge: stamp X-Policy-Confirm via the
-            // AllowWithHeaders mechanism. Per resolution rule 2 a
-            // later Confirm in the chain is recorded but does not
-            // re-stamp.
+            // Stamp X-Policy-Confirm via the AllowWithHeaders
+            // mechanism. Per resolution rule 2 a later Confirm in
+            // the chain is recorded but does not re-stamp.
             if confirm_state.first_consumed {
                 tracing::debug!(
                     target: "sbproxy::policy",

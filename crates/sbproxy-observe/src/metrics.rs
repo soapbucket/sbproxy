@@ -3292,7 +3292,7 @@ pub fn record_channel_drop(lane: &'static str, reason: &'static str) {
 /// Record one MCP pre-tool-call policy hook invocation (WOR-152 PR β).
 ///
 /// `verdict` is one of the closed labels `allow`, `deny`, or `confirm`
-/// (the OSS bridge treats `confirm` as a deny until the
+/// (the bridge treats `confirm` as a deny until the
 /// `PendingConfirmStore` lands in PR ζ; the verdict label still reads
 /// `confirm` so dashboards can distinguish the two). `mcp_server` is
 /// the logical upstream MCP server name; `tool_name` is the tool the
@@ -5169,7 +5169,7 @@ pub fn record_decision_audit_emitted(event: DecisionEvent, outcome: DecisionOutc
 ///
 /// Records the time from entering the dispatcher to the verdict
 /// being produced, labelled by `surface` (`built_in` / `plugin`).
-/// Bucket boundaries are tuned for the OSS in-process path: most
+/// Bucket boundaries are tuned for the in-process path: most
 /// decisions land under 1 ms, plugin decisions can spread to tens
 /// of milliseconds when an enforcer makes a network call.
 pub fn record_policy_decision_latency(surface: &str, duration_secs: f64) {

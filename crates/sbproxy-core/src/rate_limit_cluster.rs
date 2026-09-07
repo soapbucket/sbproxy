@@ -25,7 +25,7 @@
 //! immediate count plus a peer view that is at most one cadence stale, so the
 //! cluster over-admits by at most `(N - 1) * rate * cadence`. At the default 3
 //! second cadence a 600 rpm limit across three nodes admits about 660 rather
-//! than 1800. The bound is documented in `docs/enterprise.md` and observable
+//! than 1800. The bound is documented in `docs/configuration.md` and observable
 //! through the peer-count metric, because an approximation an operator cannot
 //! see is worse than an honest one they can.
 //!

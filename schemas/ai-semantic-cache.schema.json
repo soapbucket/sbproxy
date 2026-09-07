@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "EmbeddingCacheConfig",
-  "description": "Operator config for the OSS embedding semantic cache, parsed from an `ai_proxy` action's `semantic_cache:` block.\n\nUnknown keys are rejected, so a stale `streaming:` or `key_template:` entry fails the load instead of silently doing nothing.",
+  "description": "Operator config for the embedding semantic cache, parsed from an `ai_proxy` action's `semantic_cache:` block.\n\nUnknown keys are rejected, so a stale `streaming:` or `key_template:` entry fails the load instead of silently doing nothing.",
   "type": "object",
   "properties": {
     "enabled": {

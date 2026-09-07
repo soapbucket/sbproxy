@@ -84,8 +84,7 @@
 //! (`sbproxy-modules::policy::agent_class`) uses 300 seconds for a
 //! `Verified` or `NotMatched` verdict and 30 seconds for a `DnsError`,
 //! and [`ReverseDnsCache`] clamps whatever it is handed at one hour.
-//! The cache is process-local; no cross-pod sharing in the OSS
-//! distribution.
+//! The cache is process-local; no cross-pod sharing.
 
 use std::collections::HashMap;
 use std::net::IpAddr;

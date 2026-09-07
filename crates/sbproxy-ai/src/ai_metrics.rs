@@ -2557,7 +2557,7 @@ pub fn record_ai_outcome_attributed(
 /// counts. Any zero count is skipped so the empty cell does not
 /// land in the metric.
 ///
-/// The OSS access log + OTel span pick up the high-cardinality
+/// The access log + OTel span pick up the high-cardinality
 /// dimensions (customer, trace_id, okr) elsewhere; the ledger's
 /// Allocate-layer join works off the span's trace_id, which is also the
 /// workflow key (see [`crate::attribution::AttributionTags::trace_id`]).

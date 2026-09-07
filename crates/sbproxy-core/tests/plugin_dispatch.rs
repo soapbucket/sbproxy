@@ -2,7 +2,7 @@
 //!
 //! End-to-end coverage for the new wiring: a minimal
 //! [`PolicyEnforcer`] is invoked, the [`policy_bus`] correlates a
-//! [`PolicyVerdictEvent`] with the request, and the OSS bridge
+//! [`PolicyVerdictEvent`] with the request, and the bridge
 //! folds the verdict into the existing chain reducer. Booting the
 //! full Pingora server for one trait call is overkill, so this
 //! test exercises the dispatch and bus surfaces directly.
@@ -145,7 +145,7 @@ async fn audit_bus_round_trips_a_verdict_event() {
     );
     // try_publish either succeeds (our test bus is installed) or
     // returns the event back if a sibling test installed a closed
-    // bus. Both are valid OSS behaviours; the contract is that
+    // bus. Both are valid behaviours; the contract is that
     // the hot path never blocks.
     let outcome = policy_bus::try_publish(event.clone());
     match outcome {

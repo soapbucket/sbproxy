@@ -7,7 +7,7 @@
 //! weights, fit an inference engine to the local GPU, spawn and
 //! supervise that engine as a subprocess, and register it as a local
 //! provider in the existing routing/guardrail/budget/ledger planes.
-//! This is the single-node OSS wedge; fleet placement is a separate
+//! This is the single-node wedge; fleet placement is a separate
 //! effort.
 //!
 //! This crate is the **hardware-independent core**: everything here
