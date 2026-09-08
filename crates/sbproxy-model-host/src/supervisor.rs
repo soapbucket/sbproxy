@@ -349,7 +349,10 @@ impl EngineSupervisor {
             ));
         }
         if let Some(running) = self.inner.running() {
-            return Ok(running.clone());
+            let requested = request.execution_identity(provisioned.kind);
+            if running.execution_identity() == requested {
+                return Ok(running.clone());
+            }
         }
         if let Some(crash_loop) = &self.crash_loop {
             return Err(self.crash_loop_error(crash_loop));

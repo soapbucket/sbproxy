@@ -330,6 +330,63 @@ async fn driver_contract_is_complete_and_object_safe() {
     }
 }
 
+#[tokio::test]
+async fn model_host_supervisor_replaces_a_changed_generation_and_port() {
+    let driver: Arc<DynEngineDriver> = Arc::new(FixtureDriver {
+        kind: EngineKind::LlamaCpp,
+    });
+    let provisioned = ProvisionedEngine {
+        kind: EngineKind::LlamaCpp,
+        executable: PathBuf::from("llama-server"),
+        version: Some("fixture-1".to_string()),
+        fingerprint: "fixture:llama".to_string(),
+        provisioning: EngineProvisioning::default(),
+    };
+    let mut request = LaunchRequest {
+        deployment: "coder".to_string(),
+        generation: 1,
+        artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+        fit: fit(),
+        port: 18_080,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        selected_devices: Vec::new(),
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: Vec::new(),
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    let mut supervisor = EngineSupervisor::new(
+        "coder",
+        driver,
+        BackoffPolicy {
+            max_attempts: Some(1),
+            ..BackoffPolicy::default()
+        },
+        None,
+    );
+
+    let first = supervisor
+        .ensure_ready(&provisioned, &request)
+        .await
+        .expect("first generation ready");
+    request.generation = 2;
+    request.port = 18_081;
+    let second = supervisor
+        .ensure_ready(&provisioned, &request)
+        .await
+        .expect("replacement generation ready");
+
+    assert_eq!(second.generation, 2);
+    assert_eq!(second.port, 18_081);
+    assert!(first
+        .process
+        .has_exited()
+        .await
+        .expect("old generation stopped before replacement"));
+}
+
 struct CrashDriver {
     launches: Arc<AtomicU32>,
     allow_success: Arc<AtomicBool>,

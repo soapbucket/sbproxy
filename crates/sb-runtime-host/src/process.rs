@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::ffi::CString;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::{Read, Write as _};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd as _;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::FromRawFd as _;
@@ -18,6 +18,8 @@ use std::os::fd::FromRawFd as _;
 use std::os::fd::RawFd;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -337,9 +339,25 @@ impl CommandExecutor for TokioCommandExecutor {
                 .ok_or_else(|| spawn_error("stderr pipe was unavailable"))?;
             let tail = Arc::new(Mutex::new(BoundedTail::default()));
             let capture = Arc::clone(&tail);
+            let (stderr_cancel, drain_cancel) =
+                UnixStream::pair().map_err(|error| spawn_error(error.to_string()))?;
+            drain_cancel
+                .set_nonblocking(true)
+                .map_err(|error| spawn_error(error.to_string()))?;
+            // Read through FIFO EOF before waiting for readiness. In particular,
+            // Darwin's FIFO poll need not report a separate event after the last
+            // bytes have been consumed. The descriptor is exclusively ours.
+            let flags = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0
+                || unsafe {
+                    libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                } < 0
+            {
+                return Err(spawn_error(std::io::Error::last_os_error()));
+            }
             let drain = std::thread::Builder::new()
                 .name(format!("managed-engine-stderr-{}", child.id()))
-                .spawn(move || drain_stderr(stderr, capture))
+                .spawn(move || drain_stderr(stderr, capture, drain_cancel))
                 .map_err(|error| spawn_error(error.to_string()))?;
             let ownership = self.ownership_store.persist_current_engine_in(
                 directory,
@@ -350,6 +368,7 @@ impl CommandExecutor for TokioCommandExecutor {
             if let Err(error) = child.release() {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(stderr_cancel);
                 let _ = drain.join();
                 ownership.clear_after_exit()?;
                 return Err(spawn_error(format!("release executable gate: {error}")));
@@ -361,6 +380,7 @@ impl CommandExecutor for TokioCommandExecutor {
                 stderr_tail: tail,
                 stderr_tail_lines,
                 stderr_drain: Mutex::new(Some(drain)),
+                stderr_cancel: Mutex::new(Some(stderr_cancel)),
             }))
         }
     }
@@ -1048,6 +1068,7 @@ struct NativeEngineProcess {
     stderr_tail: Arc<Mutex<BoundedTail>>,
     stderr_tail_lines: usize,
     stderr_drain: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stderr_cancel: Mutex<Option<UnixStream>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1072,6 +1093,16 @@ impl NativeEngineProcess {
     }
 
     fn join_stderr(&self) {
+        if let Some(mut cancel) = self
+            .stderr_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            // The exact group has exited. Wake the reader and ask it to retain
+            // already queued diagnostics without waiting for another FIFO event.
+            let _ = cancel.write_all(b"1");
+        }
         if let Some(drain) = self
             .stderr_drain
             .lock()
@@ -1143,6 +1174,14 @@ impl Drop for NativeEngineProcess {
         let _ = child.kill();
         let _ = child.wait();
         let _ = self.ownership.clear_after_exit();
+        // A descendant can retain stderr after the exact group leader exits.
+        // Wake our own reader, without signalling that ambiguous group or
+        // leaving a detached drain thread waiting for a possibly permanent EOF.
+        // Ordinary shutdown first collects its bounded queued diagnostics.
+        self.stderr_cancel
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         if let Some(drain) = self
             .stderr_drain
             .get_mut()
@@ -1200,15 +1239,73 @@ impl BoundedTail {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn drain_stderr(mut stderr: impl Read, tail: Arc<Mutex<BoundedTail>>) {
+fn drain_stderr(
+    mut stderr: impl Read + std::os::fd::AsRawFd,
+    tail: Arc<Mutex<BoundedTail>>,
+    mut cancel: UnixStream,
+) {
     let mut buffer = [0_u8; 4_096];
+    let mut finishing = false;
+    let mut remaining = MAX_STDERR_TAIL_BYTES;
     loop {
-        match stderr.read(&mut buffer) {
-            Ok(0) | Err(_) => return,
-            Ok(count) => tail
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(&buffer[..count]),
+        // Only the peer's lifetime is a signal. A one-byte nonblocking read
+        // observes EOF even while a noisy descendant keeps stderr readable.
+        if !finishing {
+            match cancel.read(&mut [0_u8; 1]) {
+                Ok(0) => return,
+                Ok(_) => finishing = true,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        let limit = if finishing {
+            buffer.len().min(remaining)
+        } else {
+            buffer.len()
+        };
+        if limit == 0 {
+            return;
+        }
+        match stderr.read(&mut buffer[..limit]) {
+            Ok(0) => return,
+            Ok(count) => {
+                tail.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(&buffer[..count]);
+                if finishing {
+                    remaining -= count;
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if finishing {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        let mut descriptors = [
+            libc::pollfd {
+                fd: stderr.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // Both descriptors remain owned by this thread. Wait only after a read
+        // would block; closing the peer wakes poll without periodic polling.
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
         }
     }
 }

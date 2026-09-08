@@ -24,6 +24,7 @@ struct ScriptedDriver {
     launch_calls: AtomicU32,
     failures_before_success: u32,
     retryable: bool,
+    return_wrong_identity: AtomicBool,
     shutdown_calls: AtomicU32,
     shutdown_fails: AtomicBool,
 }
@@ -98,8 +99,13 @@ impl EngineDriver for ScriptedDriver {
             )
             .with_diagnostic_tail("Bearer SYNTHETIC_CANARY"));
         }
+        let mut identity = request.identity.clone();
+        if self.return_wrong_identity.load(Ordering::SeqCst) {
+            identity.generation = identity.generation.saturating_add(1);
+            identity.port = identity.port.saturating_add(1);
+        }
         Ok(RunningEngine {
-            identity: request.identity.clone(),
+            identity,
             selected_devices: Vec::new(),
             accelerator: "cpu",
             started_at_ms: 1,
@@ -189,6 +195,7 @@ async fn supervisor_retries_with_capped_delays_then_publishes_ready() {
         launch_calls: AtomicU32::new(0),
         failures_before_success: 2,
         retryable: true,
+        return_wrong_identity: AtomicBool::new(false),
         shutdown_calls: AtomicU32::new(0),
         shutdown_fails: AtomicBool::new(false),
     });
@@ -220,6 +227,7 @@ async fn terminal_crash_loop_blocks_relaunch_until_explicit_reset() {
         launch_calls: AtomicU32::new(0),
         failures_before_success: 1,
         retryable: false,
+        return_wrong_identity: AtomicBool::new(false),
         shutdown_calls: AtomicU32::new(0),
         shutdown_fails: AtomicBool::new(false),
     });
@@ -255,6 +263,7 @@ async fn retry_budget_exhaustion_retains_failure_times_and_blocks_relaunch() {
         launch_calls: AtomicU32::new(0),
         failures_before_success: u32::MAX,
         retryable: true,
+        return_wrong_identity: AtomicBool::new(false),
         shutdown_calls: AtomicU32::new(0),
         shutdown_fails: AtomicBool::new(false),
     });
@@ -298,6 +307,7 @@ async fn failed_shutdown_retains_running_generation_for_retry() {
         launch_calls: AtomicU32::new(0),
         failures_before_success: 0,
         retryable: true,
+        return_wrong_identity: AtomicBool::new(false),
         shutdown_calls: AtomicU32::new(0),
         shutdown_fails: AtomicBool::new(true),
     });
@@ -320,4 +330,73 @@ async fn failed_shutdown_retains_running_generation_for_retry() {
     assert_eq!(driver.shutdown_calls.load(Ordering::SeqCst), 2);
     assert!(supervisor.shutdown(Duration::from_millis(1)).await.is_ok());
     assert_eq!(driver.shutdown_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn changed_runtime_identity_stops_the_old_generation_before_relaunch() {
+    let driver = Arc::new(ScriptedDriver {
+        launch_calls: AtomicU32::new(0),
+        failures_before_success: 0,
+        retryable: true,
+        return_wrong_identity: AtomicBool::new(false),
+        shutdown_calls: AtomicU32::new(0),
+        shutdown_fails: AtomicBool::new(false),
+    });
+    let mut supervisor = EngineSupervisor::new("fixture", driver.clone(), BackoffPolicy::default());
+    let first = supervisor
+        .ensure_ready(&provisioned(), &launch())
+        .await
+        .expect("first generation ready");
+
+    let mut replacement = launch();
+    replacement.identity.generation = 2;
+    replacement.identity.port = 18_081;
+    let second = supervisor
+        .ensure_ready(&provisioned(), &replacement)
+        .await
+        .expect("replacement generation ready");
+
+    assert_eq!(first.identity.generation, 1);
+    assert_eq!(first.identity.port, 18_080);
+    assert_eq!(second.identity, replacement.identity);
+    assert_eq!(driver.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.launch_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_wrong_identity_cleanup_is_retained_until_explicit_shutdown() {
+    let driver = Arc::new(ScriptedDriver {
+        launch_calls: AtomicU32::new(0),
+        failures_before_success: 0,
+        retryable: true,
+        return_wrong_identity: AtomicBool::new(true),
+        shutdown_calls: AtomicU32::new(0),
+        shutdown_fails: AtomicBool::new(true),
+    });
+    let mut supervisor = EngineSupervisor::new("fixture", driver.clone(), BackoffPolicy::default());
+
+    let failure = supervisor
+        .ensure_ready(&provisioned(), &launch())
+        .await
+        .expect_err("wrong identity cleanup fails");
+    assert_eq!(failure.reason(), EngineFailureReason::EngineShutdownFailed);
+    assert!(supervisor.running().is_some());
+    assert_eq!(driver.launch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.shutdown_calls.load(Ordering::SeqCst), 1);
+
+    driver.return_wrong_identity.store(false, Ordering::SeqCst);
+    driver.shutdown_fails.store(false, Ordering::SeqCst);
+    supervisor
+        .shutdown(Duration::from_millis(1))
+        .await
+        .expect("explicit cleanup retry succeeds");
+    assert!(supervisor.running().is_none());
+    assert_eq!(driver.launch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.shutdown_calls.load(Ordering::SeqCst), 2);
+
+    supervisor
+        .ensure_ready(&provisioned(), &launch())
+        .await
+        .expect("launch only after cleanup succeeds");
+    assert_eq!(driver.launch_calls.load(Ordering::SeqCst), 2);
 }

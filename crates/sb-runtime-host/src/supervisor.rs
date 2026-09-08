@@ -185,8 +185,12 @@ where
         self.validate_deployment()?;
         let identity = self.driver.launch_identity(request);
         self.validate_identity(&identity, "launch")?;
-        if let Some(running) = &self.running {
-            return Ok(running.clone());
+        if let Some(running) = self.running.take() {
+            if self.driver.running_identity(&running) == identity {
+                self.running = Some(running.clone());
+                return Ok(running);
+            }
+            self.shutdown_for_replacement(running).await?;
         }
         if let Some(crash_loop) = &self.crash_loop {
             return Err(self.crash_loop_error(crash_loop));
@@ -199,7 +203,7 @@ where
                 Ok(running) => {
                     let running_identity = self.driver.running_identity(&running);
                     if running_identity != identity {
-                        let _ = self.driver.shutdown(running, Duration::from_secs(1)).await;
+                        self.shutdown_for_replacement(running).await?;
                         return Err(EngineDriverError::new(
                             EngineFailureReason::EngineInternal,
                             "driver returned a running identity that differs from the launch request",
@@ -268,6 +272,21 @@ where
         };
         self.driver.shutdown(running, grace).await?;
         self.running = None;
+        Ok(())
+    }
+
+    async fn shutdown_for_replacement(
+        &mut self,
+        running: D::RunningEngine,
+    ) -> Result<(), EngineDriverError> {
+        if let Err(error) = self
+            .driver
+            .shutdown(running.clone(), Duration::from_secs(1))
+            .await
+        {
+            self.running = Some(running);
+            return Err(error);
+        }
         Ok(())
     }
 

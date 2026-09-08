@@ -372,3 +372,81 @@ fn spawned_child_resets_an_inherited_blocked_signal_mask() {
     assert!(status);
     assert!(!marker.exists(), "child inherited a blocked SIGTERM mask");
 }
+
+#[tokio::test]
+async fn drop_does_not_wait_for_stderr_held_by_a_leaderless_descendant() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let directory = root.path().join("owners");
+    let descendant_path = root.path().join("descendant.pid");
+    let release_path = root.path().join("release-leader");
+    let process = TokioCommandExecutor::at(&directory)
+        .spawn(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_string(),
+                "/bin/sleep 30 & echo \"$!\" > \"$1\"; while [ ! -f \"$2\" ]; do /bin/sleep 0.01; done"
+                    .to_string(),
+                "neutral-drop-stderr-fixture".to_string(),
+                descendant_path.display().to_string(),
+                release_path.display().to_string(),
+            ],
+            &BTreeMap::new(),
+            20,
+        )
+        .await
+        .expect("spawn managed group fixture");
+    let leader_pid = process.id().expect("leader PID");
+    let leader = capture_managed_engine_owner(leader_pid).expect("leader generation");
+    let descendant_pid = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&descendant_path) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture publishes descendant PID");
+    let descendant = capture_managed_engine_owner(descendant_pid).expect("descendant generation");
+    std::fs::write(&release_path, b"release").expect("release exact leader");
+    wait_for_generation_to_exit(&leader, leader_pid).await;
+
+    let (finished, completion) = std::sync::mpsc::channel();
+    let drop_thread = std::thread::spawn(move || {
+        drop(process);
+        let _ = finished.send(());
+    });
+    let completed_without_descendant_exit =
+        completion.recv_timeout(Duration::from_millis(250)).is_ok();
+    let descendant_survived = capture_managed_engine_owner(descendant_pid)
+        .as_ref()
+        .is_some_and(|actual| descendant.same_process_generation(actual));
+    let retained_records = record_count(&directory);
+
+    // Clean only the captured fixture generation before any behavioral assertion,
+    // including on RED when the drop thread is still waiting on its stderr pipe.
+    if descendant_survived {
+        unsafe {
+            libc::kill(descendant_pid as i32, libc::SIGKILL);
+        }
+    }
+    wait_for_generation_to_exit(&descendant, descendant_pid).await;
+    if !completed_without_descendant_exit {
+        completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drop finishes after exact descendant cleanup");
+    }
+    drop_thread.join().expect("drop fixture thread");
+
+    assert!(
+        descendant_survived,
+        "Drop must not signal the ambiguous group"
+    );
+    assert_eq!(retained_records, 1, "ambiguous ownership remains durable");
+    assert!(
+        completed_without_descendant_exit,
+        "Drop waited for stderr held by a live leaderless descendant"
+    );
+}
