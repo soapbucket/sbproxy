@@ -13,10 +13,9 @@ use serde::Deserialize;
 
 use crate::{
     AcceleratorKind, AcquireSource, ArtifactFormat, CommandOutput, EngineAvailability,
-    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
-    EngineProvisioning, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
-    WorkerProfile,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriverError, EngineFailureReason,
+    EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner, EngineProvisioning,
+    LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine, WorkerProfile,
 };
 
 /// Default vLLM package pin used by managed uv provisioning.
@@ -363,7 +362,16 @@ impl Default for VllmDriver {
 }
 
 #[async_trait]
-impl EngineDriver for VllmDriver {
+impl sb_runtime_host::EngineDriver for VllmDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         EngineKind::Vllm
     }
@@ -375,6 +383,17 @@ impl EngineDriver for VllmDriver {
             supports_container: true,
             supports_uv: true,
         }
+    }
+
+    fn launch_identity(&self, request: &LaunchRequest) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     fn detect(&self, worker: &WorkerProfile, provisioning: &EngineProvisioning) -> EngineDetection {

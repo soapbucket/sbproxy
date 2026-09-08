@@ -6521,6 +6521,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-runtime-host"
+version = "1.14.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "sb-runtime-core",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sbproxy-ai"
 version = "0.1.0"
 dependencies = [
@@ -6776,6 +6790,7 @@ dependencies = [
  "libc",
  "minijinja",
  "sb-runtime-core",
+ "sb-runtime-host",
  "sbproxy-config",
  "sbproxy-security",
  "sbproxy-util",

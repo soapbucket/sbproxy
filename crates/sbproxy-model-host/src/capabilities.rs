@@ -441,9 +441,9 @@ fn assert_managed_driver_capabilities() -> Result<(), String> {
     let llama = crate::LlamaCppDriver::default();
     let vllm = crate::VllmDriver::default();
     let sglang = crate::SGLangDriver::default();
-    let llama_capabilities = crate::EngineDriver::capabilities(&llama);
-    let vllm_capabilities = crate::EngineDriver::capabilities(&vllm);
-    let sglang_capabilities = crate::EngineDriver::capabilities(&sglang);
+    let llama_capabilities = sb_runtime_host::EngineDriver::capabilities(&llama);
+    let vllm_capabilities = sb_runtime_host::EngineDriver::capabilities(&vllm);
+    let sglang_capabilities = sb_runtime_host::EngineDriver::capabilities(&sglang);
     if llama_capabilities.artifact_formats != [crate::ArtifactFormat::Gguf]
         || llama_capabilities.supports_container
         || llama_capabilities.supports_uv
@@ -477,7 +477,7 @@ fn assert_managed_driver_capabilities() -> Result<(), String> {
     // mistral.rs is a binary engine like llama.cpp (no container, no uv)
     // but loads safetensors and runs on CPU, Metal, and CUDA (WOR-1861).
     let mistralrs = crate::mistralrs_driver::MistralRsDriver::default();
-    let mistralrs_capabilities = crate::EngineDriver::capabilities(&mistralrs);
+    let mistralrs_capabilities = sb_runtime_host::EngineDriver::capabilities(&mistralrs);
     if mistralrs_capabilities.artifact_formats != [crate::ArtifactFormat::Safetensors]
         || !mistralrs_capabilities
             .accelerators

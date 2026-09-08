@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::{
     AcceleratorKind, AcquireSource, AcquisitionContext, ArtifactFormat, ArtifactManager,
     BackoffPolicy, Catalog, CompiledDeployment, DeploymentRevision, DeploymentRevisionDraft,
-    DeploymentRoute, DeploymentSourceMode, EngineAccel, EngineAvailability, EngineDriver,
+    DeploymentRoute, DeploymentSourceMode, DynEngineDriver, EngineAccel, EngineAvailability,
     EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod,
     EngineProvisioning, FileDeploymentRevisionStore, FileJobStore, GpuProbe, KvCacheQuant,
     LaunchRequest, LegacyHostPolicy, LlamaCppDriver, ModelMetadata, ModelMetadataProvider,
@@ -1542,7 +1542,7 @@ pub struct ProductionDeploymentPreparer {
     artifacts: Arc<ArtifactManager>,
     probe: Arc<dyn GpuProbe>,
     metadata: Arc<dyn ModelMetadataProvider>,
-    drivers: BTreeMap<EngineKind, Arc<dyn EngineDriver>>,
+    drivers: BTreeMap<EngineKind, Arc<DynEngineDriver>>,
     network_policy: NetworkPolicy,
     backoff: BackoffPolicy,
 }
@@ -2905,23 +2905,23 @@ impl ProductionDeploymentPreparer {
         metadata: Arc<dyn ModelMetadataProvider>,
         network_policy: NetworkPolicy,
     ) -> Self {
-        let drivers: BTreeMap<EngineKind, Arc<dyn EngineDriver>> = BTreeMap::from([
+        let drivers: BTreeMap<EngineKind, Arc<DynEngineDriver>> = BTreeMap::from([
             (
                 EngineKind::LlamaCpp,
-                Arc::new(LlamaCppDriver::default()) as Arc<dyn EngineDriver>,
+                Arc::new(LlamaCppDriver::default()) as Arc<DynEngineDriver>,
             ),
             (
                 EngineKind::Vllm,
-                Arc::new(VllmDriver::default()) as Arc<dyn EngineDriver>,
+                Arc::new(VllmDriver::default()) as Arc<DynEngineDriver>,
             ),
             (
                 EngineKind::SGLang,
-                Arc::new(SGLangDriver::default()) as Arc<dyn EngineDriver>,
+                Arc::new(SGLangDriver::default()) as Arc<DynEngineDriver>,
             ),
             (
                 EngineKind::MistralRs,
                 Arc::new(crate::mistralrs_driver::MistralRsDriver::default())
-                    as Arc<dyn EngineDriver>,
+                    as Arc<DynEngineDriver>,
             ),
         ]);
         Self {
@@ -2936,7 +2936,7 @@ impl ProductionDeploymentPreparer {
     }
 
     /// Replace the driver registry for deterministic integration tests.
-    pub fn with_drivers(mut self, drivers: BTreeMap<EngineKind, Arc<dyn EngineDriver>>) -> Self {
+    pub fn with_drivers(mut self, drivers: BTreeMap<EngineKind, Arc<DynEngineDriver>>) -> Self {
         self.drivers = drivers;
         self
     }

@@ -16,13 +16,20 @@ canonical form below.
 
 ## Current boundary
 
-The reusable contract seam is `sb-runtime-core`. It owns engine identity,
-availability and detection, artifact/accelerator compatibility facts, health,
-execution identity, and bounded failure reporting. The `sbproxy-model-host`
-crate consumes those contracts and continues to own catalog and artifact
-management, provisioning, process lifecycle, admission, placement, policy,
-supervision, and cluster authority. Existing model-host import paths remain
-available as compatibility re-exports.
+The reusable contract seam has two one-way layers. `sb-runtime-core` owns
+engine identity, availability and detection, artifact/accelerator compatibility
+facts, health, execution identity, and bounded failure reporting.
+`sb-runtime-host` optionally adds typed driver envelopes, tokenized process
+execution, loopback readiness, explicit-directory native process ownership,
+and retry/crash-loop supervision. The host crate depends on the core crate and
+does not depend on SBproxy.
+
+The `sbproxy-model-host` crate consumes the optional host layer while retaining
+catalog and artifact trust, engine argv templates and allowlists, fit and
+placement, durable operation jobs, admission, routing, policy, telemetry, and
+cluster authority. It also resolves SBproxy's process-ownership directory
+before passing that explicit path into the neutral host. Existing model-host
+import paths remain available as compatibility re-exports and adapters.
 
 Driver compatibility facts answer whether an engine accepts an artifact format
 or accelerator. They are not a runtime protocol conformance or readiness

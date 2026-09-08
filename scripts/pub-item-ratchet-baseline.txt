@@ -1348,3 +1348,16 @@ No item was deleted or narrowed in this change. The cross-check against the
 optional out-of-tree API consumer is the ticket's precondition for a deletion
 and it was not available to this session, so nothing was cleared for one. The
 count moved because the measurement did.
+
+2026-09-08 (neutral runtime host lifecycle): tests-only 463 to 480,
+unreferenced 2141 to 2156. This change adds a non-default `test-support`
+feature to the new public `sb-runtime-host` crate. Its fake driver, process,
+executor, readiness probe, manual clock, typed aliases, and controls exist so
+out-of-tree runtime consumers can test lifecycle integration without an
+SBproxy dependency. All of those items are exercised through the crate's
+integration-test boundary, which is intentionally the only kind of caller for
+test-support API. The wider inventory adds 21 names and removes six: six
+model-host lifecycle types gained cross-file neutral-host callers during the
+extraction, while the model-host compatibility reaper became an out-of-tree
+API-only candidate. The exact inventory is regenerated from this tree so both
+movements remain reviewable. No scanner rule or discovery boundary changed.

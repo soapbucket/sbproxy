@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 pub use sb_runtime_core::{
     EngineAvailability, EngineDetection, EngineDriverError, EngineExecutionIdentity,
     EngineFailureReason, EngineHealth,
 };
+pub use sb_runtime_host::EngineDriver;
 
 use crate::{
     AcceleratorKind, ArtifactFormat, ChunkedPrefill, EngineKind, EngineProcess, EngineProvisioning,
@@ -173,6 +173,22 @@ impl fmt::Debug for RunningEngine {
             .finish()
     }
 }
+
+/// Object-safe compatibility surface for SBproxy's concrete managed-runtime types.
+///
+/// The neutral host trait keeps consumer-owned artifact, placement, provisioning,
+/// and process types explicit. SBproxy binds those associated types once here so
+/// its runtime registry does not repeat or erase the contract at every use site.
+pub type DynEngineDriver = dyn EngineDriver<
+    ArtifactFormat = ArtifactFormat,
+    Accelerator = AcceleratorKind,
+    Worker = WorkerProfile,
+    Provisioning = EngineProvisioning,
+    ProvisionRequest = ProvisionRequest,
+    ProvisionedEngine = ProvisionedEngine,
+    LaunchRequest = LaunchRequest,
+    RunningEngine = RunningEngine,
+>;
 
 impl LaunchRequest {
     /// Data-only identity validated before host-specific launch inputs.
@@ -464,40 +480,4 @@ fn validate_argument_value(
         )));
     }
     Ok(())
-}
-
-/// Engine-specific lifecycle driven by process-wide reconciliation.
-#[async_trait]
-pub trait EngineDriver: Send + Sync {
-    /// Managed engine kind implemented by this driver.
-    fn kind(&self) -> EngineKind;
-
-    /// Static driver capabilities.
-    fn capabilities(&self) -> EngineCapabilities;
-
-    /// Detect installed and automatically acquirable engine paths.
-    fn detect(&self, worker: &WorkerProfile, provisioning: &EngineProvisioning) -> EngineDetection;
-
-    /// Provision or select one exact engine installation.
-    async fn provision(
-        &self,
-        request: &ProvisionRequest,
-    ) -> Result<ProvisionedEngine, EngineDriverError>;
-
-    /// Launch verified local artifact bytes and wait for readiness.
-    async fn launch(
-        &self,
-        provisioned: &ProvisionedEngine,
-        request: &LaunchRequest,
-    ) -> Result<RunningEngine, EngineDriverError>;
-
-    /// Check a launched engine without mutating desired state.
-    async fn health(&self, running: &RunningEngine) -> Result<EngineHealth, EngineDriverError>;
-
-    /// Gracefully stop one launched engine, forcing termination after `grace`.
-    async fn shutdown(
-        &self,
-        running: RunningEngine,
-        grace: Duration,
-    ) -> Result<(), EngineDriverError>;
 }

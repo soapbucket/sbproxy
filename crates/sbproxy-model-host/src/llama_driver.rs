@@ -12,10 +12,9 @@ use async_trait::async_trait;
 
 use crate::{
     AcceleratorKind, ArtifactFormat, BinaryAcquirePlan, EngineAccel, EngineAvailability,
-    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
-    EngineProvisioning, KvCacheQuant, LaunchRequest, ProvisionRequest, ProvisionedEngine,
-    RunningEngine, WorkerProfile,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriverError, EngineFailureReason,
+    EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner, EngineProvisioning,
+    KvCacheQuant, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine, WorkerProfile,
 };
 
 const HEALTH_PATH: &str = "/health";
@@ -184,7 +183,16 @@ impl Default for LlamaCppDriver {
 }
 
 #[async_trait]
-impl EngineDriver for LlamaCppDriver {
+impl sb_runtime_host::EngineDriver for LlamaCppDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         EngineKind::LlamaCpp
     }
@@ -200,6 +208,17 @@ impl EngineDriver for LlamaCppDriver {
             supports_container: false,
             supports_uv: false,
         }
+    }
+
+    fn launch_identity(&self, request: &LaunchRequest) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     fn detect(&self, worker: &WorkerProfile, provisioning: &EngineProvisioning) -> LlamaDetection {
