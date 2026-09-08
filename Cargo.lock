@@ -8822,6 +8822,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-runtime-host"
+version = "1.14.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "sb-runtime-core",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sbproxy"
 version = "1.14.0"
 dependencies = [
@@ -9672,6 +9687,7 @@ dependencies = [
  "nvml-wrapper",
  "reqwest 0.12.28",
  "sb-runtime-core",
+ "sb-runtime-host",
  "sbproxy-ai",
  "sbproxy-config",
  "sbproxy-security",

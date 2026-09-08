@@ -8,11 +8,11 @@ use async_trait::async_trait;
 use sbproxy_model_host::{
     build_sglang_container_plan, build_vllm_container_plan, validate_engine_args,
     ArtifactCacheMetadata, ArtifactFile, ArtifactFormat, BackoffPolicy, CommandExecutor,
-    CommandOutput, ContainerRuntime, CudaBuildPrerequisites, EngineAccel, EngineAvailability,
-    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineProcess, EngineProcessRunner,
-    EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore, FitPlan,
-    KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, MistralRsBinarySource,
+    CommandOutput, ContainerRuntime, CudaBuildPrerequisites, DynEngineDriver, EngineAccel,
+    EngineAvailability, EngineCapabilities, EngineCommand, EngineDetection, EngineDriver,
+    EngineDriverError, EngineFailureReason, EngineHealth, EngineKind, EngineProcess,
+    EngineProcessRunner, EngineProvisioning, EngineReadinessProbe, EngineSupervisor, FileJobStore,
+    FitPlan, KvCacheQuant, LaunchRequest, LlamaBinarySource, LlamaCppDriver, MistralRsBinarySource,
     MistralRsDriver, OperationJob, OperationKind, OperationProgress, OperationState,
     ProvisionRequest, ProvisionedEngine, Quant, ReadyArtifact, ResolvedArtifact, RunningEngine,
     SGLangDriver, SupervisorClock, SupportLevel, VllmDriver, VllmHost, VllmLaunchMode,
@@ -51,6 +51,15 @@ struct FixtureDriver {
 
 #[async_trait]
 impl EngineDriver for FixtureDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = sbproxy_model_host::AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         self.kind
     }
@@ -81,6 +90,17 @@ impl EngineDriver for FixtureDriver {
             reason: "fixture engine is available".to_string(),
             remediation: None,
         }
+    }
+
+    fn launch_identity(&self, request: &LaunchRequest) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     async fn provision(
@@ -234,6 +254,29 @@ fn fit() -> FitPlan {
     }
 }
 
+fn assert_neutral_driver_contract<Driver>()
+where
+    Driver: sb_runtime_host::EngineDriver<
+        ArtifactFormat = ArtifactFormat,
+        Accelerator = sbproxy_model_host::AcceleratorKind,
+        Worker = WorkerProfile,
+        Provisioning = EngineProvisioning,
+        ProvisionRequest = ProvisionRequest,
+        ProvisionedEngine = ProvisionedEngine,
+        LaunchRequest = LaunchRequest,
+        RunningEngine = RunningEngine,
+    >,
+{
+}
+
+#[test]
+fn every_first_party_driver_implements_the_neutral_host_contract() {
+    assert_neutral_driver_contract::<LlamaCppDriver>();
+    assert_neutral_driver_contract::<VllmDriver>();
+    assert_neutral_driver_contract::<SGLangDriver>();
+    assert_neutral_driver_contract::<MistralRsDriver>();
+}
+
 #[tokio::test]
 async fn driver_contract_is_complete_and_object_safe() {
     for (kind, format) in [
@@ -241,7 +284,7 @@ async fn driver_contract_is_complete_and_object_safe() {
         (EngineKind::Vllm, ArtifactFormat::Safetensors),
         (EngineKind::MistralRs, ArtifactFormat::Safetensors),
     ] {
-        let driver: Arc<dyn EngineDriver> = Arc::new(FixtureDriver { kind });
+        let driver: Arc<DynEngineDriver> = Arc::new(FixtureDriver { kind });
         let provisioning = EngineProvisioning::default();
         assert_eq!(
             driver.detect(&worker(), &provisioning).availability,
@@ -294,6 +337,15 @@ struct CrashDriver {
 
 #[async_trait]
 impl EngineDriver for CrashDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = sbproxy_model_host::AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         EngineKind::LlamaCpp
     }
@@ -310,6 +362,17 @@ impl EngineDriver for CrashDriver {
             kind: EngineKind::LlamaCpp,
         }
         .detect(worker, provisioning)
+    }
+
+    fn launch_identity(&self, request: &LaunchRequest) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     async fn provision(
@@ -394,7 +457,7 @@ async fn crash_loop_observes_backoff_retains_failure_and_requires_durable_reset(
     let store = FileJobStore::open(directory.path(), 50).unwrap();
     let launches = Arc::new(AtomicU32::new(0));
     let allow_success = Arc::new(AtomicBool::new(false));
-    let driver: Arc<dyn EngineDriver> = Arc::new(CrashDriver {
+    let driver: Arc<DynEngineDriver> = Arc::new(CrashDriver {
         launches: launches.clone(),
         allow_success: allow_success.clone(),
     });

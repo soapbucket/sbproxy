@@ -2109,6 +2109,15 @@ struct ProductionFixtureDriver {
 
 #[async_trait]
 impl EngineDriver for ProductionFixtureDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = sbproxy_model_host::AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = sbproxy_model_host::LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         EngineKind::Vllm
     }
@@ -2134,6 +2143,20 @@ impl EngineDriver for ProductionFixtureDriver {
             reason: "fixture driver is ready".to_string(),
             remediation: None,
         }
+    }
+
+    fn launch_identity(
+        &self,
+        request: &sbproxy_model_host::LaunchRequest,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     async fn provision(
@@ -2257,7 +2280,7 @@ models:
         EngineKind::Vllm,
         Arc::new(ProductionFixtureDriver {
             launches: launches.clone(),
-        }) as Arc<dyn EngineDriver>,
+        }) as Arc<sbproxy_model_host::DynEngineDriver>,
     )]);
     let preparer = Arc::new(
         ProductionDeploymentPreparer::new(

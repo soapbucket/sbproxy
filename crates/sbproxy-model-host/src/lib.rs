@@ -76,8 +76,6 @@ pub mod scheduling;
 pub mod sglang_driver;
 pub mod supervisor;
 pub mod supply_chain;
-#[cfg(test)]
-mod test_env;
 #[cfg(feature = "tokenizer")]
 pub mod tokenize;
 pub mod uv_release;
@@ -147,9 +145,9 @@ pub use device_residency::{
     ResidencyProtection,
 };
 pub use engine_driver::{
-    validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
-    EngineDriverError, EngineExecutionIdentity, EngineFailureReason, EngineHealth, EngineTuning,
-    LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
+    validate_engine_args, DynEngineDriver, EngineAvailability, EngineCapabilities, EngineDetection,
+    EngineDriver, EngineDriverError, EngineExecutionIdentity, EngineFailureReason, EngineHealth,
+    EngineTuning, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
     estimate_throughput, fp8_supported, live_rss_within_planned_envelope, memory_occupancy,

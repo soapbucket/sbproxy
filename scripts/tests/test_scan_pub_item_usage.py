@@ -327,7 +327,7 @@ class ReExportIsNotAConsumerTest(unittest.TestCase):
 
 
 class PublicApiCrateTest(unittest.TestCase):
-    """The four crates CLAUDE.md names as the public API surface.
+    """The five crates CLAUDE.md names as the public API surface.
 
     Every `pub` item in one of them is published API whatever this scan
     can see about its callers, so the two verdicts that change a
@@ -355,6 +355,7 @@ class PublicApiCrateTest(unittest.TestCase):
             "sbproxy-config",
             "sbproxy-httpkit",
             "sb-runtime-core",
+            "sb-runtime-host",
         ):
             with self.subTest(crate=crate):
                 verdict, why = self._verdict(crate)

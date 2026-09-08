@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sb-runtime-core",
+    "crates/sb-runtime-host",
     "crates/sbproxy",
     "crates/sbproxy-core",
     "crates/sbproxy-config",
@@ -49,6 +50,7 @@ members = [
 # work. CI's `cargo build --workspace --locked` still picks them up.
 default-members = [
     "crates/sb-runtime-core",
+    "crates/sb-runtime-host",
     "crates/sbproxy",
     "crates/sbproxy-core",
     "crates/sbproxy-config",
@@ -128,6 +130,7 @@ readme = "README.md"
 [workspace.dependencies]
 # Internal crates
 sb-runtime-core = { path = "crates/sb-runtime-core" }
+sb-runtime-host = { path = "crates/sb-runtime-host" }
 sbproxy-core = { path = "crates/sbproxy-core" }
 sbproxy-config = { path = "crates/sbproxy-config" }
 sbproxy-modules = { path = "crates/sbproxy-modules" }

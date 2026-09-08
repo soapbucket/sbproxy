@@ -424,8 +424,8 @@ def external_tree_names(root: Path) -> set[str]:
 
 
 # The workspace's public API surface, named in CLAUDE.md under
-# Conventions: "The public API surface is the following four crates,
-# and only these four." Every `pub` item in one of them is public API
+# Conventions: "The public API surface is the following five crates,
+# and only these five." Every `pub` item in one of them is public API
 # by definition, whatever this scan can see about its callers, so the
 # two verdicts that change a signature are both wrong there. `narrow` is
 # wrong because `pub(crate)` on a published crate's item is a breaking
@@ -438,7 +438,13 @@ def external_tree_names(root: Path) -> set[str]:
 # `sbproxy-events` and `sbproxy-proxy` are named in the same section as
 # planned and not yet shipped, so they are deliberately absent.
 PUBLIC_API_CRATES = frozenset(
-    {"sbproxy-plugin", "sbproxy-config", "sbproxy-httpkit", "sb-runtime-core"}
+    {
+        "sbproxy-plugin",
+        "sbproxy-config",
+        "sbproxy-httpkit",
+        "sb-runtime-core",
+        "sb-runtime-host",
+    }
 )
 
 
@@ -473,7 +479,7 @@ def verdict_for(item: dict) -> tuple[str, str]:
     if item.get("crate") in PUBLIC_API_CRATES:
         return (
             "keep",
-            f"`{item['crate']}` is one of the four crates CLAUDE.md names as the "
+            f"`{item['crate']}` is one of the five crates CLAUDE.md names as the "
             "public API surface, so this is published API whatever calls it in this "
             "repository; narrowing or deleting it is a breaking change for consumers "
             "no scan of this tree can see",

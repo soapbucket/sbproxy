@@ -1,0 +1,29 @@
+[package]
+name = "sb-runtime-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Runtime-neutral managed engine process and lifecycle host"
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+async-trait.workspace = true
+sb-runtime-core.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

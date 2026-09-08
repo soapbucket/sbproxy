@@ -17,14 +17,15 @@
 //! process tree) implements the same trait in a later phase.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub use sb_runtime_host::{BackoffPolicy, SupervisorClock, TokioSupervisorClock};
+
 use crate::{
-    EngineDriver, EngineDriverError, EngineFailureReason, FileJobStore, LaunchRequest,
+    DynEngineDriver, EngineDriverError, EngineFailureReason, FileJobStore, LaunchRequest,
     OperationJob, OperationKind, OperationProgress, OperationState, ProvisionRequest,
     ProvisionedEngine, RunningEngine,
 };
@@ -102,78 +103,6 @@ pub trait EngineLauncher: Send + Sync {
     /// Kill the engine process tree and free its VRAM. Best-effort;
     /// errors are logged, not surfaced (eviction must make progress).
     async fn kill(&self);
-}
-
-/// Bounded exponential-backoff policy for restarts.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BackoffPolicy {
-    /// Delay before the first retry.
-    pub base: Duration,
-    /// Ceiling on the delay.
-    pub max: Duration,
-    /// Give up after this many consecutive failures. `None` = retry
-    /// forever (with the delay capped at `max`).
-    pub max_attempts: Option<u32>,
-}
-
-impl Default for BackoffPolicy {
-    fn default() -> Self {
-        Self {
-            base: Duration::from_secs(1),
-            max: Duration::from_secs(60),
-            max_attempts: Some(5),
-        }
-    }
-}
-
-impl BackoffPolicy {
-    /// Delay before retry number `attempt` (1-based): `base * 2^(n-1)`
-    /// capped at `max`. Deterministic (no jitter) so it is testable;
-    /// the production launcher can add jitter at the sleep site.
-    pub fn delay_for(&self, attempt: u32) -> Duration {
-        if attempt == 0 {
-            return self.base;
-        }
-        let shift = attempt.saturating_sub(1).min(20);
-        let scaled = self.base.saturating_mul(1u32 << shift);
-        scaled.min(self.max)
-    }
-
-    /// Whether another attempt is allowed after `attempts` failures.
-    pub fn should_retry(&self, attempts: u32) -> bool {
-        match self.max_attempts {
-            Some(cap) => attempts < cap,
-            None => true,
-        }
-    }
-}
-
-/// Clock and sleep boundary used by managed-engine retry supervision.
-#[async_trait]
-pub trait SupervisorClock: Send + Sync {
-    /// Wait for one retry delay.
-    async fn sleep(&self, duration: Duration);
-    /// Current Unix timestamp in milliseconds.
-    fn now_ms(&self) -> u64;
-}
-
-/// Production supervisor clock backed by Tokio and the system wall clock.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TokioSupervisorClock;
-
-#[async_trait]
-impl SupervisorClock for TokioSupervisorClock {
-    async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
-    }
-
-    fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
-            .unwrap_or(0)
-    }
 }
 
 /// Errors the supervisor surfaces to a caller.
@@ -292,12 +221,11 @@ pub struct CrashLoopState {
 /// Typed managed-engine supervisor used by the process-wide runtime manager.
 pub struct EngineSupervisor {
     deployment: String,
-    driver: Arc<dyn EngineDriver>,
+    driver_kind: crate::EngineKind,
     backoff: BackoffPolicy,
-    clock: Arc<dyn SupervisorClock>,
+    inner: sb_runtime_host::EngineSupervisor<DynEngineDriver>,
     job_store: Option<FileJobStore>,
     last_job_id: Mutex<Option<String>>,
-    running: Option<RunningEngine>,
     crash_loop: Option<CrashLoopState>,
 }
 
@@ -306,9 +234,9 @@ impl std::fmt::Debug for EngineSupervisor {
         formatter
             .debug_struct("EngineSupervisor")
             .field("deployment", &self.deployment)
-            .field("driver_kind", &self.driver.kind())
+            .field("driver_kind", &self.driver_kind)
             .field("backoff", &self.backoff)
-            .field("running", &self.running)
+            .field("running", &self.inner.running())
             .field("crash_loop", &self.crash_loop)
             .finish_non_exhaustive()
     }
@@ -318,31 +246,53 @@ impl EngineSupervisor {
     /// Construct an idle supervisor for one canonical deployment.
     pub fn new(
         deployment: impl Into<String>,
-        driver: Arc<dyn EngineDriver>,
+        driver: Arc<DynEngineDriver>,
         backoff: BackoffPolicy,
         job_store: Option<FileJobStore>,
     ) -> Self {
-        Self {
-            deployment: deployment.into(),
-            driver,
+        let deployment = deployment.into();
+        let driver_kind = driver.kind();
+        let inner = sb_runtime_host::EngineSupervisor::new(
+            deployment.clone(),
+            Arc::clone(&driver),
             backoff,
-            clock: Arc::new(TokioSupervisorClock),
+        );
+        Self {
+            deployment,
+            driver_kind,
+            backoff,
+            inner,
             job_store,
             last_job_id: Mutex::new(None),
-            running: None,
             crash_loop: None,
         }
     }
 
     /// Override the retry clock for deterministic tests.
-    pub fn with_clock(mut self, clock: Arc<dyn SupervisorClock>) -> Self {
-        self.clock = clock;
-        self
+    pub fn with_clock(self, clock: Arc<dyn SupervisorClock>) -> Self {
+        let Self {
+            deployment,
+            driver_kind,
+            backoff,
+            inner,
+            job_store,
+            last_job_id,
+            crash_loop,
+        } = self;
+        Self {
+            deployment,
+            driver_kind,
+            backoff,
+            inner: inner.with_clock(clock),
+            job_store,
+            last_job_id,
+            crash_loop,
+        }
     }
 
     /// Currently running engine generation, when ready.
     pub fn running(&self) -> Option<&RunningEngine> {
-        self.running.as_ref()
+        self.inner.running()
     }
 
     /// Retained terminal crash loop, when reset is required.
@@ -365,7 +315,7 @@ impl EngineSupervisor {
     ) -> Result<ProvisionedEngine, EngineDriverError> {
         self.validate_deployment()?;
         let job = self.begin_job(OperationKind::Provision)?;
-        match self.driver.provision(request).await {
+        match self.inner.provision(request).await {
             Ok(provisioned) => {
                 self.finish_job(job.as_ref(), None)?;
                 Ok(provisioned)
@@ -398,7 +348,7 @@ impl EngineSupervisor {
                 false,
             ));
         }
-        if let Some(running) = &self.running {
+        if let Some(running) = self.inner.running() {
             return Ok(running.clone());
         }
         if let Some(crash_loop) = &self.crash_loop {
@@ -413,65 +363,32 @@ impl EngineSupervisor {
                 return Err(error);
             }
         };
-        let mut attempts = 0u32;
-        let mut retained: Option<CrashLoopState> = None;
-        loop {
-            match self.driver.launch(provisioned, request).await {
-                Ok(running) => {
-                    let launch_result = self.finish_job(launch_job.as_ref(), None);
-                    let load_result = self.finish_job(load_job.as_ref(), None);
-                    if let Err(error) = launch_result.and(load_result) {
-                        let _ = self
-                            .driver
-                            .shutdown(running.clone(), Duration::from_secs(1))
-                            .await;
-                        return Err(error);
-                    }
-                    self.crash_loop = None;
-                    self.running = Some(running.clone());
-                    return Ok(running);
-                }
-                Err(error) => {
-                    attempts = attempts.saturating_add(1);
-                    // Log the bounded, credential-redacted stderr tail
-                    // here: it is otherwise held only in memory (the
-                    // error diagnostic and crash-loop status), so a
-                    // process that exits after the failure, such as a
-                    // certification run whose only artifact is the boot
-                    // log, would lose the one diagnostic the error
-                    // message tells the operator to inspect.
-                    tracing::error!(
-                        deployment = %self.deployment,
-                        reason = %error.reason(),
-                        attempts,
-                        retryable = error.retryable(),
-                        stderr_tail = error.diagnostic_tail().unwrap_or(""),
-                        "managed engine launch attempt failed"
-                    );
-                    let now_ms = self.clock.now_ms();
-                    let first_failure_at_ms = retained
-                        .as_ref()
-                        .map_or(now_ms, |state| state.first_failure_at_ms);
-                    retained = Some(CrashLoopState {
-                        attempts,
-                        reason: error.reason(),
-                        last_error: error.message().to_string(),
-                        stderr_tail: error.diagnostic_tail().map(str::to_string),
-                        first_failure_at_ms,
-                        last_failure_at_ms: now_ms.max(first_failure_at_ms),
-                        next_remediation: error.remediation().to_string(),
-                        last_job_id: load_job.as_ref().map(|job| job.id.clone()),
-                    });
-                    if error.retryable() && self.backoff.should_retry(attempts) {
-                        self.clock.sleep(self.backoff.delay_for(attempts)).await;
-                        continue;
-                    }
-                    self.crash_loop = retained;
-                    let launch_result = self.finish_job(launch_job.as_ref(), Some(&error));
-                    let load_result = self.finish_job(load_job.as_ref(), Some(&error));
-                    launch_result.and(load_result)?;
+        match self.inner.ensure_ready(provisioned, request).await {
+            Ok(running) => {
+                let launch_result = self.finish_job(launch_job.as_ref(), None);
+                let load_result = self.finish_job(load_job.as_ref(), None);
+                if let Err(error) = launch_result.and(load_result) {
+                    let _ = self.inner.shutdown(Duration::from_secs(1)).await;
                     return Err(error);
                 }
+                self.crash_loop = None;
+                Ok(running)
+            }
+            Err(error) => {
+                self.crash_loop = self.inner.crash_loop().map(|state| CrashLoopState {
+                    attempts: state.attempts,
+                    reason: state.reason,
+                    last_error: state.last_error.clone(),
+                    stderr_tail: state.stderr_tail.clone(),
+                    first_failure_at_ms: state.first_failure_at_ms,
+                    last_failure_at_ms: state.last_failure_at_ms,
+                    next_remediation: state.next_remediation.clone(),
+                    last_job_id: load_job.as_ref().map(|job| job.id.clone()),
+                });
+                let launch_result = self.finish_job(launch_job.as_ref(), Some(&error));
+                let load_result = self.finish_job(load_job.as_ref(), Some(&error));
+                launch_result.and(load_result)?;
+                Err(error)
             }
         }
     }
@@ -482,32 +399,17 @@ impl EngineSupervisor {
         running: &RunningEngine,
     ) -> Result<crate::EngineHealth, EngineDriverError> {
         self.validate_deployment()?;
-        if running.deployment != self.deployment {
-            return Err(EngineDriverError::new(
-                EngineFailureReason::EngineInternal,
-                format!(
-                    "health deployment {:?} does not match supervisor {:?}",
-                    running.deployment, self.deployment
-                ),
-                "check health through the deployment that owns the running generation",
-                false,
-            ));
-        }
-        self.driver.health(running).await
+        self.inner.health(running).await
     }
 
     /// Clear a retained crash loop and persist the explicit reset event.
     pub fn reset(&mut self) -> Result<Option<OperationJob>, EngineDriverError> {
         self.validate_deployment()?;
         let job = self.begin_job(OperationKind::Reset)?;
-        let previous = self.crash_loop.take();
-        match self.finish_job(job.as_ref(), None) {
-            Ok(terminal) => Ok(terminal),
-            Err(error) => {
-                self.crash_loop = previous;
-                Err(error)
-            }
-        }
+        let terminal = self.finish_job(job.as_ref(), None)?;
+        self.inner.reset();
+        self.crash_loop = None;
+        Ok(terminal)
     }
 
     /// Stop the running generation and persist a terminal stop job.
@@ -517,12 +419,9 @@ impl EngineSupervisor {
     ) -> Result<Option<OperationJob>, EngineDriverError> {
         self.validate_deployment()?;
         let job = self.begin_job(OperationKind::Stop)?;
-        if let Some(running) = self.running.clone() {
-            if let Err(error) = self.driver.shutdown(running, grace).await {
-                self.finish_job(job.as_ref(), Some(&error))?;
-                return Err(error);
-            }
-            self.running = None;
+        if let Err(error) = self.inner.shutdown(grace).await {
+            self.finish_job(job.as_ref(), Some(&error))?;
+            return Err(error);
         }
         self.finish_job(job.as_ref(), None)
     }

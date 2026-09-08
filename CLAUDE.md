@@ -709,8 +709,8 @@ chain-construction path.
 
 ## Conventions
 
-- The public API surface is the following four crates, and only
-  these four. Internal crates must not be imported from them, and
+- The public API surface is the following five crates, and only
+  these five. Internal crates must not be imported from them, and
   no other crate in this workspace is part of the public surface
   today.
   - `sbproxy-plugin` - public plugin trait surface (`PolicyEnforcer`,
@@ -731,6 +731,11 @@ chain-construction path.
     availability, compatibility, health, and bounded failure contracts.
     It must not depend on gateway policy, provider routing, config
     compilation, process lifecycle, or cluster authority.
+  - `sb-runtime-host` - optional runtime-neutral typed driver, process,
+    readiness, native ownership, and lifecycle supervision. It consumes
+    `sb-runtime-core`, accepts explicit process state paths, and must not
+    depend on SBproxy or SUDS crates, gateway policy, provider routing,
+    config compilation, placement, or cluster authority.
 
   Two further public crates are planned but not yet shipped:
   - `sbproxy-events` (planned) - until it lands, events and metrics

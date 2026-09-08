@@ -1,0 +1,4 @@
+{
+  "type": "added",
+  "message": "Add the optional sb-runtime-host crate for typed managed-engine drivers, tokenized process execution without caller shell parsing, native ownership, readiness, and lifecycle supervision."
+}

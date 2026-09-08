@@ -26,10 +26,9 @@ use async_trait::async_trait;
 
 use crate::{
     AcceleratorKind, ArtifactFormat, BinaryAcquirePlan, EngineAccel, EngineAvailability,
-    EngineCapabilities, EngineCommand, EngineDetection, EngineDriver, EngineDriverError,
-    EngineFailureReason, EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner,
-    EngineProvisioning, LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
-    WorkerProfile,
+    EngineCapabilities, EngineCommand, EngineDetection, EngineDriverError, EngineFailureReason,
+    EngineHealth, EngineKind, EngineLaunchMethod, EngineProcessRunner, EngineProvisioning,
+    LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine, WorkerProfile,
 };
 
 /// mistral.rs `/health` returns a static 200 without touching the model
@@ -191,7 +190,16 @@ impl Default for MistralRsDriver {
 }
 
 #[async_trait]
-impl EngineDriver for MistralRsDriver {
+impl sb_runtime_host::EngineDriver for MistralRsDriver {
+    type ArtifactFormat = ArtifactFormat;
+    type Accelerator = AcceleratorKind;
+    type Worker = WorkerProfile;
+    type Provisioning = EngineProvisioning;
+    type ProvisionRequest = ProvisionRequest;
+    type ProvisionedEngine = ProvisionedEngine;
+    type LaunchRequest = LaunchRequest;
+    type RunningEngine = RunningEngine;
+
     fn kind(&self) -> EngineKind {
         EngineKind::MistralRs
     }
@@ -207,6 +215,17 @@ impl EngineDriver for MistralRsDriver {
             supports_container: false,
             supports_uv: false,
         }
+    }
+
+    fn launch_identity(&self, request: &LaunchRequest) -> sb_runtime_core::EngineExecutionIdentity {
+        request.execution_identity(self.kind())
+    }
+
+    fn running_identity(
+        &self,
+        running: &RunningEngine,
+    ) -> sb_runtime_core::EngineExecutionIdentity {
+        running.execution_identity()
     }
 
     fn detect(&self, worker: &WorkerProfile, provisioning: &EngineProvisioning) -> EngineDetection {

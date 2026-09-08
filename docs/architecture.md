@@ -98,9 +98,13 @@ sbproxy/
                               compatibility, health, and bounded failure
                               contracts. It has no gateway or host-lifecycle
                               dependency.
+    sb-runtime-host/      - Optional runtime-neutral typed drivers, tokenized
+                              process execution, loopback readiness, native
+                              process ownership, and lifecycle supervision. It
+                              consumes only sb-runtime-core plus host mechanics.
     sbproxy-model-host/   - Local model-serving subsystem: model catalog,
                               GPU fit planner, engine supervisor. Single-node,
-                              engine-agnostic. It consumes sb-runtime-core and
+                              engine-agnostic. It consumes sb-runtime-host and
                               preserves compatibility re-exports for existing
                               callers.
     sbproxy-classifiers/  - Pure-Rust ONNX inference and tokenizer wrapper
