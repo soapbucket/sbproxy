@@ -1,6 +1,6 @@
 # Model host
 
-*Last modified: 2026-08-28*
+*Last modified: 2026-09-08*
 
 SBproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
@@ -15,6 +15,18 @@ load during the compatibility window, but new configurations should use the
 canonical form below.
 
 ## Current boundary
+
+The reusable contract seam is `sb-runtime-core`. It owns engine identity,
+availability and detection, artifact/accelerator compatibility facts, health,
+execution identity, and bounded failure reporting. The `sbproxy-model-host`
+crate consumes those contracts and continues to own catalog and artifact
+management, provisioning, process lifecycle, admission, placement, policy,
+supervision, and cluster authority. Existing model-host import paths remain
+available as compatibility re-exports.
+
+Driver compatibility facts answer whether an engine accepts an artifact format
+or accelerator. They are not a runtime protocol conformance or readiness
+record. Consumers must keep those concerns separate.
 
 The worker-local runtime is complete enough to operate as one coherent system:
 

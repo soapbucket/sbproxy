@@ -13,84 +13,8 @@
 //! These types derive `JsonSchema` so the `serve:` surface appears in
 //! `sb-config.schema.json`.
 
+pub use sb_runtime_core::EngineKind;
 use serde::{Deserialize, Serialize};
-
-/// Which inference engine serves a model. An allowlisted enum, not a
-/// `cmd:` string: the runtime owns the argument template for each
-/// engine, so config chooses an engine and its knobs, never an
-/// arbitrary executable.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineKind {
-    /// vLLM, the datacenter default, driven as a supervised
-    /// subprocess over its OpenAI-compatible HTTP surface.
-    #[default]
-    Vllm,
-    /// SGLang (WOR-1905), driven as a supervised subprocess over its
-    /// OpenAI-compatible HTTP surface, exactly like vLLM. The real launch
-    /// is `python -m sglang.launch_server`; the sentinel binary name is
-    /// never resolved on `PATH`. It loads the same safetensors weights as
-    /// vLLM on a CUDA worker and leads on RadixAttention prefix caching and
-    /// high-concurrency throughput, so it is an explicit opt-in alternative.
-    #[serde(rename = "sglang")]
-    SGLang,
-    /// llama.cpp `llama-server`, the low-VRAM / GGUF / edge path.
-    LlamaCpp,
-    /// mistral.rs (WOR-1861), driven as a supervised subprocess over its
-    /// OpenAI-compatible HTTP surface via the upstream prebuilt `mistralrs`
-    /// binary (pinned tag + sha256, PATH-first), exactly like llama.cpp.
-    /// The pure-Rust lane without the `embedded` feature's build tax.
-    /// Deliberately last in declaration order: placement sorts candidate
-    /// engines by this ordinal, and mistral.rs stays an explicit opt-in
-    /// behind the certified lanes (its MoE BF16 prefill measured 7 to 9x
-    /// behind vLLM upstream; dense and quantized models are its lane).
-    #[serde(rename = "mistralrs")]
-    MistralRs,
-}
-
-impl EngineKind {
-    /// The binary name looked up on `PATH` for this engine.
-    pub fn binary_name(self) -> &'static str {
-        match self {
-            EngineKind::Vllm => "vllm",
-            // A sentinel: SGLang is launched as `python -m
-            // sglang.launch_server`, so this name is never resolved on
-            // `PATH`. The managed driver owns the real invocation.
-            EngineKind::SGLang => "sglang",
-            EngineKind::LlamaCpp => "llama-server",
-            // The v0.9 unified CLI: upstream's installer and release
-            // tarballs both ship a single `mistralrs` binary.
-            EngineKind::MistralRs => "mistralrs",
-        }
-    }
-
-    /// The model id this engine's OpenAI surface accepts in request
-    /// bodies for a managed deployment (WOR-1861). vLLM and SGLang are
-    /// launched with `--served-model-name <deployment>`, so the
-    /// deployment id is the served name; llama.cpp ignores the field.
-    /// mistral.rs has no served-name flag: it registers the model under
-    /// the id it loaded (the snapshot path) and accepts `default` as the
-    /// alias for the loaded model, so the deployment id would be
-    /// rejected with a 404-shaped error.
-    pub fn request_model_id(self, deployment: &str) -> &str {
-        match self {
-            EngineKind::Vllm | EngineKind::SGLang | EngineKind::LlamaCpp => deployment,
-            EngineKind::MistralRs => "default",
-        }
-    }
-}
 
 /// The engine an operator asks for on a model (WOR-1684). Unlike
 /// [`EngineKind`] (the resolved identity), this includes `Auto`, which

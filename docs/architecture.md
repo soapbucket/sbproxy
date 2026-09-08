@@ -1,6 +1,6 @@
 # SBproxy architecture and deployment guide
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-09-08*
 
 This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
@@ -94,9 +94,15 @@ sbproxy/
                               for the AI gateway: extracts a query, embeds
                               it, searches a vector store, selects a bounded
                               context window.
+    sb-runtime-core/      - Runtime-neutral engine identity, availability,
+                              compatibility, health, and bounded failure
+                              contracts. It has no gateway or host-lifecycle
+                              dependency.
     sbproxy-model-host/   - Local model-serving subsystem: model catalog,
                               GPU fit planner, engine supervisor. Single-node,
-                              engine-agnostic.
+                              engine-agnostic. It consumes sb-runtime-core and
+                              preserves compatibility re-exports for existing
+                              callers.
     sbproxy-classifiers/  - Pure-Rust ONNX inference and tokenizer wrapper
                               for in-process detectors (guardrails, agent
                               scoring).

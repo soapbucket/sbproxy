@@ -6545,6 +6545,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-runtime-core"
+version = "1.14.0"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+]
+
+[[package]]
 name = "sbproxy-ai"
 version = "0.1.0"
 dependencies = [
@@ -6799,6 +6807,7 @@ dependencies = [
  "hex",
  "libc",
  "minijinja",
+ "sb-runtime-core",
  "sbproxy-config",
  "sbproxy-security",
  "sbproxy-util",

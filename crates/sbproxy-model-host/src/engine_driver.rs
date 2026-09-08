@@ -9,55 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+pub use sb_runtime_core::{
+    EngineAvailability, EngineDetection, EngineDriverError, EngineExecutionIdentity,
+    EngineFailureReason, EngineHealth,
+};
 
 use crate::{
     AcceleratorKind, ArtifactFormat, ChunkedPrefill, EngineKind, EngineProcess, EngineProvisioning,
     FileJobStore, FitPlan, ReadyArtifact, ResolvedArtifact, WorkerProfile,
 };
 
-/// Whether an engine can run on the detected worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineAvailability {
-    /// A compatible engine is installed and ready for use.
-    Available,
-    /// A compatible, pinned engine can be provisioned automatically.
-    Acquirable,
-    /// The engine exists but cannot run on this worker or artifact.
-    Incompatible,
-    /// Host policy prevents otherwise supported provisioning or launch.
-    Blocked,
-}
-
-/// Stable detection result shared by CLI, admin, and reconciliation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct EngineDetection {
-    /// Managed engine kind.
-    pub kind: EngineKind,
-    /// Current availability state.
-    pub availability: EngineAvailability,
-    /// Detected or pinned version, when known.
-    pub version: Option<String>,
-    /// Concise operator-safe reason.
-    pub reason: String,
-    /// Action that makes a non-available engine usable.
-    pub remediation: Option<String>,
-}
-
-/// Static capabilities declared by one engine driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineCapabilities {
-    /// Artifact formats the engine can consume.
-    pub artifact_formats: Vec<ArtifactFormat>,
-    /// Accelerator families supported by this build path.
-    pub accelerators: Vec<AcceleratorKind>,
-    /// Whether the driver implements isolated container launch.
-    pub supports_container: bool,
-    /// Whether the driver implements a managed uv environment.
-    pub supports_uv: bool,
-}
+/// Static compatibility facts declared by one model-host engine driver.
+pub type EngineCapabilities = sb_runtime_core::EngineCapabilities<ArtifactFormat, AcceleratorKind>;
 
 /// Typed provisioning input for one resolved artifact and worker.
 #[derive(Debug, Clone)]
@@ -181,6 +144,18 @@ pub struct RunningEngine {
     pub process: Arc<dyn EngineProcess>,
 }
 
+impl RunningEngine {
+    /// Data-only execution identity shared with control-plane consumers.
+    pub fn execution_identity(&self) -> EngineExecutionIdentity {
+        EngineExecutionIdentity {
+            deployment: self.deployment.clone(),
+            generation: self.generation,
+            kind: self.kind,
+            port: self.port,
+        }
+    }
+}
+
 impl fmt::Debug for RunningEngine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -199,268 +174,20 @@ impl fmt::Debug for RunningEngine {
     }
 }
 
-/// Current health of a launched engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineHealth {
-    /// Process is alive but its readiness endpoint is not ready yet.
-    Starting,
-    /// Process is alive and its readiness endpoint is healthy.
-    Ready,
-    /// Process is alive but its health endpoint reports an error.
-    Unhealthy,
-    /// Process has exited.
-    Stopped,
-}
-
-/// Stable engine failure taxonomy exposed by jobs and status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineFailureReason {
-    /// Host policy blocks the requested action.
-    EngineBlocked,
-    /// Engine, artifact, or worker capabilities are incompatible.
-    EngineIncompatible,
-    /// Engine provisioning failed.
-    EngineProvisionFailed,
-    /// The local artifact is missing or not verified.
-    ArtifactNotReady,
-    /// An operator argument attempts to override a runtime-owned field.
-    UnsafeArgument,
-    /// The process could not be spawned.
-    EngineSpawnFailed,
-    /// The process exited before becoming ready.
-    EngineEarlyExit,
-    /// The readiness deadline elapsed.
-    EngineReadinessTimeout,
-    /// A live health check failed.
-    EngineHealthFailed,
-    /// Graceful and forced shutdown failed.
-    EngineShutdownFailed,
-    /// The bounded launch retry budget is exhausted until explicit reset.
-    CrashLoop,
-    /// Internal invariant or clock failure.
-    EngineInternal,
-}
-
-impl EngineFailureReason {
-    /// Stable snake-case reason code.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::EngineBlocked => "engine_blocked",
-            Self::EngineIncompatible => "engine_incompatible",
-            Self::EngineProvisionFailed => "engine_provision_failed",
-            Self::ArtifactNotReady => "artifact_not_ready",
-            Self::UnsafeArgument => "unsafe_argument",
-            Self::EngineSpawnFailed => "engine_spawn_failed",
-            Self::EngineEarlyExit => "engine_early_exit",
-            Self::EngineReadinessTimeout => "engine_readiness_timeout",
-            Self::EngineHealthFailed => "engine_health_failed",
-            Self::EngineShutdownFailed => "engine_shutdown_failed",
-            Self::CrashLoop => "crash_loop",
-            Self::EngineInternal => "engine_internal",
-        }
-    }
-}
-
-impl fmt::Display for EngineFailureReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// Operator-safe managed-engine failure with required remediation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EngineDriverError {
-    reason: EngineFailureReason,
-    message: String,
-    remediation: String,
-    retryable: bool,
-    diagnostic_tail: Option<String>,
-}
-
-impl EngineDriverError {
-    /// Construct a typed error. Empty remediation is replaced with a safe fallback.
-    pub fn new(
-        reason: EngineFailureReason,
-        message: impl Into<String>,
-        remediation: impl Into<String>,
-        retryable: bool,
-    ) -> Self {
-        let message = bounded_operator_text(&message.into(), 2_048);
-        let remediation = bounded_operator_text(&remediation.into(), 1_024);
-        Self {
-            reason,
-            message: if message.trim().is_empty() {
-                "managed engine operation failed".to_string()
-            } else {
-                message
-            },
-            remediation: if remediation.trim().is_empty() {
-                "inspect the model-host operation job and retry after correcting the cause"
-                    .to_string()
-            } else {
-                remediation
-            },
-            retryable,
-            diagnostic_tail: None,
-        }
-    }
-
-    /// Construct a policy-blocked failure.
-    pub fn blocked(message: impl Into<String>, remediation: impl Into<String>) -> Self {
-        Self::new(
-            EngineFailureReason::EngineBlocked,
-            message,
-            remediation,
-            false,
-        )
-    }
-
-    /// Construct an artifact-verification failure.
-    pub fn artifact_not_ready(message: impl Into<String>) -> Self {
-        Self::new(
-            EngineFailureReason::ArtifactNotReady,
-            message,
-            "pull and verify the exact catalog artifact before launching the deployment",
-            false,
-        )
-    }
-
-    /// Construct a rejected argument failure.
-    pub fn unsafe_argument(message: impl Into<String>) -> Self {
-        Self::new(
-            EngineFailureReason::UnsafeArgument,
-            message,
-            "remove the argument and use the typed model-host configuration field instead",
-            false,
-        )
-    }
-
-    /// Stable reason code.
-    pub const fn reason(&self) -> EngineFailureReason {
-        self.reason
-    }
-
-    /// Operator action that can resolve the failure.
-    pub fn remediation(&self) -> &str {
-        &self.remediation
-    }
-
-    /// Whether bounded retry can succeed without changing desired state.
-    pub const fn retryable(&self) -> bool {
-        self.retryable
-    }
-
-    /// Concise operator-safe failure message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Attach a bounded, credential-redacted diagnostic tail.
-    pub fn with_diagnostic_tail(mut self, diagnostic: impl AsRef<str>) -> Self {
-        let diagnostic = sanitize_diagnostic_tail(diagnostic.as_ref());
-        self.diagnostic_tail = (!diagnostic.is_empty()).then_some(diagnostic);
-        self
-    }
-
-    /// Bounded, credential-redacted diagnostic retained for crash-loop status.
-    pub fn diagnostic_tail(&self) -> Option<&str> {
-        self.diagnostic_tail.as_deref()
-    }
-}
-
-impl fmt::Display for EngineDriverError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}: {}; remediation: {}",
-            self.reason, self.message, self.remediation
-        )
-    }
-}
-
-impl std::error::Error for EngineDriverError {}
-
-fn sanitize_diagnostic_tail(diagnostic: &str) -> String {
-    let bounded = diagnostic
-        .lines()
-        .rev()
-        .take(100)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .chars()
-        .take(8_192)
-        .collect::<String>();
-    redact_sensitive_tokens(&bounded)
-        .chars()
-        .take(8_192)
-        .collect()
-}
-
-fn bounded_operator_text(text: &str, max_chars: usize) -> String {
-    let printable = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(max_chars)
-        .collect::<String>();
-    redact_sensitive_tokens(&printable)
-        .chars()
-        .take(max_chars)
-        .collect()
-}
-
-fn redact_sensitive_tokens(text: &str) -> String {
-    let mut tokens = text.split_whitespace().peekable();
-    let mut redacted = Vec::new();
-    while let Some(token) = tokens.next() {
-        redacted.push(token.to_string());
-        if (token.eq_ignore_ascii_case("bearer")
-            || matches!(token, "--api-key" | "--token" | "--hf-token"))
-            && tokens.next().is_some()
-        {
-            redacted.push("[REDACTED]".to_string());
-        }
-    }
-    redacted.join(" ")
-}
-
 impl LaunchRequest {
+    /// Data-only identity validated before host-specific launch inputs.
+    pub fn execution_identity(&self, kind: EngineKind) -> EngineExecutionIdentity {
+        EngineExecutionIdentity {
+            deployment: self.deployment.clone(),
+            generation: self.generation,
+            kind,
+            port: self.port,
+        }
+    }
+
     /// Validate verified artifact identity, paths, runtime identity, and extra arguments.
     pub fn validate(&self, kind: EngineKind) -> Result<(), EngineDriverError> {
-        if self.deployment.trim().is_empty() {
-            return Err(EngineDriverError::new(
-                EngineFailureReason::EngineInternal,
-                "launch deployment must not be empty",
-                "reconcile a valid canonical deployment before launching",
-                false,
-            ));
-        }
-        if self.generation == 0 {
-            return Err(EngineDriverError::new(
-                EngineFailureReason::EngineInternal,
-                "launch generation must be positive",
-                "reconcile a numbered deployment generation before launching",
-                false,
-            ));
-        }
-        if self.port == 0 {
-            return Err(EngineDriverError::new(
-                EngineFailureReason::EngineInternal,
-                "launch port must be positive",
-                "allocate an unused loopback port before launching",
-                true,
-            ));
-        }
+        self.execution_identity(kind).validate()?;
         if self.ready_timeout.is_zero() {
             return Err(EngineDriverError::new(
                 EngineFailureReason::EngineInternal,

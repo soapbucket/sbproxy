@@ -43,6 +43,7 @@ tokenizer = ["dep:tokenizers", "dep:minijinja"]
 hf-xet-transport = ["weights", "dep:hf-hub", "dep:tokio-util"]
 
 [dependencies]
+sb-runtime-core.workspace = true
 sbproxy-util.workspace = true
 sbproxy-config.workspace = true
 sbproxy-security.workspace = true

@@ -709,6 +709,60 @@ fn launch_request_accepts_only_verified_paths_inside_the_snapshot() {
 }
 
 #[test]
+fn launch_request_validates_neutral_identity_before_host_artifact() {
+    let mut request = LaunchRequest {
+        deployment: " ".to_string(),
+        generation: 0,
+        artifact: ready(EngineKind::LlamaCpp, ArtifactFormat::Gguf),
+        fit: fit(),
+        port: 0,
+        accelerator: sbproxy_model_host::AcceleratorKind::Cpu,
+        selected_devices: Vec::new(),
+        kv_quant: KvCacheQuant::Auto,
+        extra_args: Vec::new(),
+        engine_tuning: Default::default(),
+        max_concurrency: 1,
+        modality: Default::default(),
+        ready_timeout: Duration::from_secs(1),
+    };
+    request.artifact.metadata.trust = "legacy-unverified".to_string();
+
+    let deployment = request
+        .validate(EngineKind::LlamaCpp)
+        .expect_err("identity validation runs before artifact validation");
+    assert_eq!(deployment.reason(), EngineFailureReason::EngineInternal);
+    assert_eq!(deployment.message(), "launch deployment must not be empty");
+    assert!(!deployment.retryable());
+
+    request.deployment = "coder".to_string();
+    let generation = request
+        .validate(EngineKind::LlamaCpp)
+        .expect_err("generation follows deployment validation");
+    assert_eq!(generation.reason(), EngineFailureReason::EngineInternal);
+    assert_eq!(generation.message(), "launch generation must be positive");
+    assert!(!generation.retryable());
+
+    request.generation = 1;
+    let port = request
+        .validate(EngineKind::LlamaCpp)
+        .expect_err("port follows generation validation");
+    assert_eq!(port.reason(), EngineFailureReason::EngineInternal);
+    assert_eq!(port.message(), "launch port must be positive");
+    assert!(port.retryable());
+
+    request.port = 18_080;
+    let artifact = request
+        .validate(EngineKind::LlamaCpp)
+        .expect_err("host-specific artifact validation follows neutral identity");
+    assert_eq!(artifact.reason(), EngineFailureReason::ArtifactNotReady);
+    assert_eq!(
+        artifact.message(),
+        "artifact aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa has trust state \"legacy-unverified\""
+    );
+    assert!(!artifact.retryable());
+}
+
+#[test]
 fn launch_request_requires_devices_that_match_the_accelerator() {
     let mut request = LaunchRequest {
         deployment: "coder".to_string(),
