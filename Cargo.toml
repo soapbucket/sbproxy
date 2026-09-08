@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/sb-runtime-core",
     "crates/sbproxy",
     "crates/sbproxy-core",
     "crates/sbproxy-config",
@@ -47,6 +48,7 @@ members = [
 # `cargo test` (no --workspace flag) skip them for day-to-day proxy
 # work. CI's `cargo build --workspace --locked` still picks them up.
 default-members = [
+    "crates/sb-runtime-core",
     "crates/sbproxy",
     "crates/sbproxy-core",
     "crates/sbproxy-config",
@@ -125,6 +127,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
+sb-runtime-core = { path = "crates/sb-runtime-core" }
 sbproxy-core = { path = "crates/sbproxy-core" }
 sbproxy-config = { path = "crates/sbproxy-config" }
 sbproxy-modules = { path = "crates/sbproxy-modules" }

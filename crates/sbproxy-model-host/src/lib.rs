@@ -148,8 +148,8 @@ pub use device_residency::{
 };
 pub use engine_driver::{
     validate_engine_args, EngineAvailability, EngineCapabilities, EngineDetection, EngineDriver,
-    EngineDriverError, EngineFailureReason, EngineHealth, EngineTuning, LaunchRequest,
-    ProvisionRequest, ProvisionedEngine, RunningEngine,
+    EngineDriverError, EngineExecutionIdentity, EngineFailureReason, EngineHealth, EngineTuning,
+    LaunchRequest, ProvisionRequest, ProvisionedEngine, RunningEngine,
 };
 pub use fit::{
     estimate_throughput, fp8_supported, live_rss_within_planned_envelope, memory_occupancy,

@@ -327,7 +327,7 @@ class ReExportIsNotAConsumerTest(unittest.TestCase):
 
 
 class PublicApiCrateTest(unittest.TestCase):
-    """The three crates CLAUDE.md names as the public API surface.
+    """The four crates CLAUDE.md names as the public API surface.
 
     Every `pub` item in one of them is published API whatever this scan
     can see about its callers, so the two verdicts that change a
@@ -350,7 +350,12 @@ class PublicApiCrateTest(unittest.TestCase):
     def test_a_public_api_crate_item_is_never_narrowed(self) -> None:
         """`pub(crate)` on a published crate's item is a breaking change,
         and in-file use was making this scan advise exactly that."""
-        for crate in ("sbproxy-plugin", "sbproxy-config", "sbproxy-httpkit"):
+        for crate in (
+            "sbproxy-plugin",
+            "sbproxy-config",
+            "sbproxy-httpkit",
+            "sb-runtime-core",
+        ):
             with self.subTest(crate=crate):
                 verdict, why = self._verdict(crate)
                 self.assertEqual(verdict, "keep")

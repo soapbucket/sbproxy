@@ -1,5 +1,5 @@
 # sbproxy (Rust workspace)
-*Last modified: 2026-09-06*
+*Last modified: 2026-09-08*
 
 The active implementation of sbproxy. Cargo workspace with ~20
 crates under `crates/`, an e2e suite under `e2e/`, examples under
@@ -601,8 +601,8 @@ chain-construction path.
 
 ## Conventions
 
-- The public API surface is the following three crates, and only
-  these three. Internal crates must not be imported from them, and
+- The public API surface is the following four crates, and only
+  these four. Internal crates must not be imported from them, and
   no other crate in this workspace is part of the public surface
   today.
   - `sbproxy-plugin` - public plugin trait surface (`PolicyEnforcer`,
@@ -619,6 +619,10 @@ chain-construction path.
     point.
   - `sbproxy-httpkit` - HTTP request/response helpers shared by
     plugin authors.
+  - `sb-runtime-core` - runtime-neutral engine identity,
+    availability, compatibility, health, and bounded failure contracts.
+    It must not depend on gateway policy, provider routing, config
+    compilation, process lifecycle, or cluster authority.
 
   Two further public crates are planned but not yet shipped:
   - `sbproxy-events` (planned) - until it lands, events and metrics
