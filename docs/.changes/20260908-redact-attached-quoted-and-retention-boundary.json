@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Redact attached, quoted, and retention-boundary credentials from model-host failure diagnostic tails."
+}
