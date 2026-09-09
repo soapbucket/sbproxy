@@ -4,7 +4,7 @@
 
 ## What you will build
 
-A gateway that verifies AI-agent identities at the edge. Inbound agents sign each request with an Ed25519 key under RFC 9421 HTTP Message Signatures, and SBproxy checks the signature against a directory of known agent keys before the request reaches the upstream. You will also publish a key directory and agent card for an SBproxy signing identity.
+A gateway that verifies AI-agent identities at the edge. Inbound agents sign each request with an Ed25519 key under RFC 9421 HTTP Message Signatures, and sbproxy checks the signature against a directory of known agent keys before the request reaches the upstream. You will also publish a key directory and agent card for an sbproxy signing identity.
 
 The two jobs are separate. `bot_auth` verifies callers. `web_bot_auth_publish`
 serves discovery documents for a public key whose private half is held by a
@@ -20,7 +20,7 @@ signer. Publishing the key does not create or distribute that private key.
 
 ## Install
 
-You do not have to compile anything to run SBproxy. One line installs the
+You do not have to compile anything to run sbproxy. One line installs the
 prebuilt binary on Linux amd64/arm64 or Apple Silicon macOS and places it in
 `~/.local/bin`:
 
@@ -78,9 +78,9 @@ origins:
       enabled: true
       key_id: "sbproxy-key-2026-05-31"
       public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-      agent_name: "SBproxy"
+      agent_name: "sbproxy"
       directory_url: "https://blog.local/.well-known/http-message-signatures-directory"
-      description: "Example SBproxy deployment with outbound Web Bot Auth signing."
+      description: "Example sbproxy deployment with outbound Web Bot Auth signing."
       contact_url: "mailto:abuse@example.com"
 ```
 
@@ -163,7 +163,7 @@ curl -i -H 'Host: blog.local' \
 # HTTP/1.1 200 OK
 ```
 
-Discovery: fetch the signing-key directory SBproxy publishes. A signer using
+Discovery: fetch the signing-key directory sbproxy publishes. A signer using
 the matching private key can point verifiers at this URL.
 
 ```bash
@@ -204,7 +204,7 @@ curl -i -H 'Host: blog.local' \
 - A request whose `keyid` is not in the `agents` directory returns `401`.
 - A request signed by a directory key returns `200` and reaches the upstream.
 - `GET /.well-known/http-message-signatures-directory` returns `200` with `Content-Type: application/http-message-signatures-directory+json` and a JSON body containing a `keys` array whose single entry has `"kid": "sbproxy-key-2026-05-31"`.
-- `GET /.well-known/web-bot-auth/agent-card` returns `200` with `"name": "SBproxy"` in the body.
+- `GET /.well-known/web-bot-auth/agent-card` returns `200` with `"name": "sbproxy"` in the body.
 
 ## Next steps
 

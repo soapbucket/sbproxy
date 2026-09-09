@@ -1,7 +1,7 @@
 # Intent detection and quality-based routing
 *Last modified: 2026-08-26*
 
-SBproxy can classify each AI prompt into a coarse intent and use prompt-aware
+sbproxy can classify each AI prompt into a coarse intent and use prompt-aware
 classifier scores to choose among eligible providers. Both capabilities are
 available in the stock binary through `proxy.classifier_hooks`. Omitting the
 block keeps intent on the built-in keyword heuristic and leaves quality
@@ -69,7 +69,7 @@ provider that may be considered on a hooked route. Each contract names the
 classifier model and the exact label whose score represents that provider's
 suitability for the current prompt. At most 64 contracts are accepted. If a
 contract is missing, a call fails, a label is absent, the common deadline
-expires, or every score is below `minimum_score`, SBproxy preserves the
+expires, or every score is below `minimum_score`, sbproxy preserves the
 configured router's decision.
 
 Run `sbproxy validate --config sb.yml` before publication to check the

@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://sbproxy.dev/logo.svg" alt="SBproxy" width="80" height="80">
+  <img src="https://sbproxy.dev/logo.svg" alt="sbproxy" width="80" height="80">
 </p>
 
-# SBproxy
+# sbproxy
 
-*Last modified: 2026-09-05*
+*Last modified: 2026-09-09*
 
 <p align="center">
   <a href="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml"><img src="https://github.com/soapbucket/sbproxy/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
@@ -15,15 +15,15 @@
   <a href="https://sbproxy.dev"><img src="https://img.shields.io/badge/docs-sbproxy.dev-16150F.svg" alt="Documentation"></a>
 </p>
 
-SBproxy is a single Rust binary that puts one policy engine in front of three kinds of traffic: HTTP APIs, AI model calls across 70 native providers reaching 200+ models through one OpenAI-compatible endpoint, and MCP or agent-to-agent tool calls. All three run through the same request pipeline, so a rate limit, a guardrail, a budget cap, and an audit record behave the same way no matter which traffic type triggered them. Every feature in this repository ships under Apache-2.0.
+sbproxy is a single Rust binary that puts one policy engine in front of three kinds of traffic: HTTP APIs, AI model calls across 70 native providers reaching 200+ models through one OpenAI-compatible endpoint, and MCP or agent-to-agent tool calls. All three run through the same request pipeline, so a rate limit, a guardrail, a budget cap, and an audit record behave the same way no matter which traffic type triggered them. Every feature in this repository ships under Apache-2.0.
 
 ## Why sbproxy
 
 - **Extension without a sidecar.** Five engines run in the same process as the request pipeline: CEL for one-line gates, Rego via the Regorus interpreter for teams migrating policies they already wrote for OPA, Lua and JavaScript for stateful transforms, and sandboxed WebAssembly for anything those can't express. There is no OPA server to run alongside the proxy and no separate plugin daemon. Extension bundles add a hook (action, auth, policy, or transform) from a local directory or a git checkout pinned to a commit SHA plus a content digest (the entry file by default, the whole bundle on request), with optional signature verification, hot-reloaded with no rebuild. See [Extending sbproxy](docs/plugins.md).
 
-- **A verifiable audit trail.** Security, config, key-mutation, and admin-action records each append to their own hash-chained, Ed25519-signed file when you opt the channel in, and `sbproxy audit verify` re-derives the chain from genesis to catch a tampered entry. Policy and guardrail decisions also publish as typed records to your SIEM. Every category of the OWASP LLM Top 10 (2026 edition) is graded enforced, enforced with named limits, or out of gateway scope, each against a named test or a stated reason, alongside eight gateway-layer controls no published list covers. See [AI gateway security coverage](docs/ai-gateway-security-coverage.md).
+- **A tamper-evident audit trail.** Security, config, key-mutation, and admin-action events each append to their own hash-chained, Ed25519-signed log when you opt the channel in; `sbproxy audit verify` re-derives the chain from genesis and catches a tampered entry. Guardrail and policy decisions publish separately as typed records to your SIEM. See [Audit log](docs/audit-log.md).
 
-- **Spend and egress that fail closed.** Budgets deny at the cap across seven scopes instead of logging past it. Every outbound destination the gateway reaches is recorded in a running inventory across ten traffic purposes; a default-deny allowlist arms six of the ten, and engine artifact downloads are the one purpose it can't reach yet. See [AI gateway security coverage](docs/ai-gateway-security-coverage.md).
+- **Coverage graded against OWASP's LLM Top 10.** [AI gateway security coverage](docs/ai-gateway-security-coverage.md) rates every OWASP LLM Top 10 (2026) category enforced, enforced with named limits, or out of gateway scope, plus eight gateway-layer risks that list doesn't cover. Budgets deny at the cap across seven scopes instead of logging past it, and every outbound destination is tracked across fourteen traffic purposes behind a default-deny allowlist; engine artifact downloads are the one purpose it still can't reach.
 
 - **An MCP gateway built for an upstream you don't control.** Tool contracts are pinned by digest in a committed lockfile and re-checked on every catalog refresh; a definition that moved is graded by a compatibility oracle and either reported or blocked, a rename is caught by re-digesting the old name, and a version bump that understates a breaking change fails a linter check before it ships. Tool access is scoped per caller, default-deny. See [MCP and agents](docs/mcp-and-agents.md).
 
@@ -103,12 +103,12 @@ target/release/sbproxy --version
 
 ## Related projects
 
-- [Homebrew tap](https://github.com/soapbucket/homebrew-tap): Homebrew packaging for SBproxy.
+- [Homebrew tap](https://github.com/soapbucket/homebrew-tap): Homebrew packaging for sbproxy.
 - [Agentic security demo](https://github.com/soapbucket/agentic-security-demo): a Docker Compose walkthrough of agent detection, signed requests, and agent budgets.
-- [SBproxy Bench](https://github.com/soapbucket/sbproxy-bench): a shared benchmark harness for comparing HTTP proxies and AI gateways.
+- [sbproxy-bench](https://github.com/soapbucket/sbproxy-bench): a shared benchmark harness for comparing HTTP proxies and AI gateways.
 - [ADRF specification](https://github.com/soapbucket/adrf-spec): the YAML format and schema for agent-detection rule packs.
-- [Pingora fork](https://github.com/soapbucket/pingora): Soap Bucket's fork of Cloudflare's proxy framework, used by SBproxy.
+- [Pingora fork](https://github.com/soapbucket/pingora): Soap Bucket's fork of Cloudflare's proxy framework, used by sbproxy.
 
 ## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow. SBproxy is released under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow. sbproxy is released under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and [TRADEMARKS](TRADEMARKS.md).

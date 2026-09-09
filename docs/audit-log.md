@@ -1,7 +1,8 @@
 # Audit log
-*Last modified: 2026-08-30*
 
-SBproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
+*Last modified: 2026-09-09*
+
+sbproxy's audit surface is a set of narrow, structured channels rather than one audit framework. This page documents what actually ships: the admin-action audit rows served at `/api/audit/recent`, the `config_audit` / `security_audit` / `key_audit` / `sbproxy::admin::audit` tracing channels, the tamper-evident chains each of those four can be written to, the `AdminAuditEmitter` plugin seam, and the emission metric. There is no `sbproxy_audit` crate and no envelope middleware.
 
 One thing on this page is durable and provable, and the rest is not. `audit.sink: chain` writes every `security_audit` event to a hash-chained, Ed25519-signed file that `sbproxy audit verify` re-derives from genesis. `audit.config_path`, `audit.key_path`, and `audit.admin_path` each opt one more channel into its own chained file under the same signing identity, verified the same way with `--channel config`, `--channel key`, or `--channel admin`; see [Tamper-evident security audit trail](#tamper-evident-security-audit-trail). Everything else here is either an in-memory ring that dies with the process or a tracing stream whose durability is whatever your collector gives it. Read the sections below with that split in mind, because a log stream is a record of what the proxy said rather than a record of what happened: whoever can write the file can rewrite it.
 

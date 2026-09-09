@@ -53,7 +53,7 @@ The `Host` header on the request does not match any configured origin.
 Check:
 - Run `sbproxy validate sb.yml` to confirm the config parses.
 - Confirm the request's `Host` header matches the origin name exactly, including any port suffix.
-- SBproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
+- sbproxy uses a bloom filter for fast hostname lookup. If you just added an origin via hot reload, wait a second and retry.
 - These 404s land in `sbproxy_requests_total` under the client-supplied hostname (the cardinality limiter collapses excess values into `__other__`) and in the access log with `error_class: "not_found"`, so a flood of them is visible: it is usually a DNS record pointing at the proxy for a hostname you never configured, or scanning traffic.
 
 ## Clients get 502 Bad Gateway
@@ -121,9 +121,9 @@ Check:
 
 ## Requests are slow
 
-SBproxy adds well under 1 ms of overhead under normal load. If you see more, the cause is almost always upstream or DNS.
+sbproxy adds well under 1 ms of overhead under normal load. If you see more, the cause is almost always upstream or DNS.
 
-1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
+1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not sbproxy.
 2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
 4. Cap runaway scripts at the engine that runs them: `proxy.scripting.lua.sandbox.max_execution_ms` for Lua, `proxy.scripting.javascript.sandbox.budget_ms` for JavaScript. Both default to 100 ms and both take effect on reload.
@@ -201,7 +201,7 @@ Check:
 - Remember that validation does not contact Redis. The first L2 operation
   performs TLS, `AUTH`, and `SELECT`, so trust, credential, server-side database,
   and reachability failures appear only when traffic uses shared state.
-- Check that the SBproxy process can read `ca_file`, `cert_file`, and `key_file`.
+- Check that the sbproxy process can read `ca_file`, `cert_file`, and `key_file`.
   `openssl x509 -in <file> -noout -subject -issuer` safely checks certificate
   parsing. Let `sbproxy validate` check that the client certificate and key
   match, rather than dumping either file.
@@ -216,7 +216,7 @@ Check:
   See [degradation.md](degradation.md).
 - Reconnection is automatic. Broken connections leave the pool, and a later
   operation opens a new connection. Fix Redis or the trust/authentication
-  configuration, then send a new cache miss or shared-state operation. SBproxy
+  configuration, then send a new cache miss or shared-state operation. sbproxy
   does not need a restart when the configured connection material is unchanged.
 
 The runtime error reason points at the next check without exposing the Redis
@@ -277,7 +277,7 @@ application can continue while shared-state guarantees are degraded.
 
 Check:
 - For ACME auto-cert, confirm `acme.email` is set and the DNS A/AAAA record points at this server. Let's Encrypt needs a successful HTTP-01 or TLS-ALPN-01 challenge.
-- For BYO certificates, check that the cert and key paths are readable by the SBproxy process and the cert chain matches the leaf.
+- For BYO certificates, check that the cert and key paths are readable by the sbproxy process and the cert chain matches the leaf.
 - Run `openssl s_client -servername <host> -connect <host>:443` to see the server's offered chain.
 - The TLS layer uses `rustls` with the `ring` crypto provider. TLS 1.3 by default with TLS 1.2 fallback.
 
@@ -297,7 +297,7 @@ Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC liste
 
 Check:
 - Config compilation rejects `proxy.http3.enabled: true`. Remove the block or set `enabled: false`.
-- If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
+- If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to sbproxy.
 
 ## A local model will not serve
 

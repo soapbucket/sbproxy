@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-27*
 
-Every origin decides who may call it with an `authentication` block, a sibling of `action` in `sb.yml` (`auth` is an accepted alias). SBproxy ships fifteen built-in providers, from a static API key to a full OpenID Connect login. This page is the chooser: which provider fits which caller, how to accept more than one on the same origin, and what the rest of the gateway does with the identity a provider establishes. The field-by-field reference for all fifteen lives in [configuration.md](configuration.md#authentication).
+Every origin decides who may call it with an `authentication` block, a sibling of `action` in `sb.yml` (`auth` is an accepted alias). sbproxy ships fifteen built-in providers, from a static API key to a full OpenID Connect login. This page is the chooser: which provider fits which caller, how to accept more than one on the same origin, and what the rest of the gateway does with the identity a provider establishes. The field-by-field reference for all fifteen lives in [configuration.md](configuration.md#authentication).
 
 Two related things are deliberately absent from the tables below. mTLS client certificates are verified during the TLS handshake, before any auth provider runs, so they are configured on the listener rather than per origin; see [what rides alongside](#what-rides-alongside-authentication). And a `type:` value that names none of the fifteen falls through to the auth plugin registry, so a linked plugin crate can add a type such as `saml` without patching the proxy ([configuration.md](configuration.md#authentication)).
 
@@ -120,7 +120,7 @@ One round trip through that config, from a caller already moved to the new token
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant P as SBproxy
+    participant P as sbproxy
     participant U as test.sbproxy.dev
 
     C->>P: GET /get, Host: api.local<br/>Authorization: Bearer new-token-1
@@ -139,7 +139,7 @@ sequenceDiagram
 - **Decision records.** Every auth allow and deny publishes an `auth` record on the decision-audit feed for SIEM consumers. The record carries the method, never the subject. See [decision-records.md](decision-records.md).
 - **Trust tiers.** Verifier outcomes feed the four-value trust tier: a verified `bot_auth` signature or CAP token earns `strong`, a failed one drops the request to `suspicious`, and policies read the result as `request.trust_tier`. See [trust-tiers.md](trust-tiers.md).
 - **mTLS at the listener.** `proxy.mtls` verifies client certificates in the TLS handshake, before any provider here runs, and passes the verified cert metadata upstream as `X-Client-Cert-*` headers. See [mTLS client authentication](configuration.md#mtls-client-authentication) and [mtls-client-auth](../examples/mtls-client-auth/).
-- **DPoP binding.** `bearer` and `jwt` take `require_dpop` to demand an RFC 9449 proof on every request, and `jwt` additionally takes `require_mtls_bound` for RFC 8705 certificate-bound tokens. See [sender-constrained Bearer](configuration.md#sender-constrained-bearer-rfc-9449). For the proofs SBproxy itself mints on upstream calls, see [outbound-dpop.md](outbound-dpop.md).
+- **DPoP binding.** `bearer` and `jwt` take `require_dpop` to demand an RFC 9449 proof on every request, and `jwt` additionally takes `require_mtls_bound` for RFC 8705 certificate-bound tokens. See [sender-constrained Bearer](configuration.md#sender-constrained-bearer-rfc-9449). For the proofs sbproxy itself mints on upstream calls, see [outbound-dpop.md](outbound-dpop.md).
 
 ## A misspelled key is a config error, not a missing control
 

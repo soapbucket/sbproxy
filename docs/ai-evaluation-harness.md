@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-26*
 
-SBproxy's AI toolkit registers immutable, explicitly versioned datasets and
+sbproxy's AI toolkit registers immutable, explicitly versioned datasets and
 evaluates already-recorded candidate responses through the authenticated admin
 plane. The run is offline: it never sends dataset entries, candidate responses,
 or judge material to a model endpoint. This makes the operation reproducible
@@ -191,7 +191,7 @@ sbproxy ai evaluate \
   --judge-criterion clarity
 ```
 
-There is no judge endpoint or judge token flag. SBproxy parses and aggregates
+There is no judge endpoint or judge token flag. sbproxy parses and aggregates
 the supplied records; it does not call a judge service.
 
 ## Result and retention contract

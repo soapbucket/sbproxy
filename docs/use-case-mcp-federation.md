@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. SBproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogs of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
+Every team that wires an agent up to a tool ends up standing up its own MCP server: one for the GitHub org, one for the internal database, one for the ticket tracker. Six months later there are a dozen of them, each with its own auth story, its own idea of who is allowed to call `delete_repo`, and no shared record of what any agent actually did. sbproxy's MCP gateway collapses that sprawl into one endpoint: it aggregates the tool catalogs of every upstream server behind a single virtual MCP server, gates every `tools/call` with default-deny RBAC keyed on the caller's identity, and can turn a REST API with no MCP support at all into governed tools with nothing but an OpenAPI spec. This guide builds that gateway end to end, with real curls against a real (if intentionally tiny) upstream.
 
 ## What you will build
 

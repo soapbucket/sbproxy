@@ -4,7 +4,7 @@
 
 ![A request denied by the WAF baseline inside a layered ip_filter -> ddos -> waf -> dlp stack](assets/waf-layered.gif)
 
-SBproxy ships a Web Application Firewall. It is a curated signature
+sbproxy ships a Web Application Firewall. It is a curated signature
 baseline of 16 rules, against roughly 900 in the OWASP Core Rule Set.
 Operators reasonably ask what to do about that gap. This page records
 the decision not to close it by embedding a SecLang engine, says plainly
@@ -150,7 +150,7 @@ read the rule count, believe the CRS name, and skip the WAF they actually
 needed. Sixteen rules that say sixteen rules is a defensible product.
 Three hundred rules that imply nine hundred is a liability.
 
-The cost of this decision is real and we accept it: SBproxy's WAF will
+The cost of this decision is real and we accept it: sbproxy's WAF will
 not catch what a tuned CRS deployment catches, and an operator with a
 compliance requirement naming ModSecurity or CRS cannot satisfy it with
 this policy alone. The next three sections are about making that cheap to
@@ -162,28 +162,28 @@ The normal answer, and the one to reach for when you need real CRS. Run
 ModSecurity (the nginx connector or Apache), Coraza (Caddy natively,
 Envoy or Istio through its proxy-wasm filter, HAProxy through SPOA), or a
 CDN WAF such as Cloudflare, Fastly, or AWS WAF at the edge, and put
-SBproxy behind it.
+sbproxy behind it.
 
 ```text
-client -> [ nginx + ModSecurity/CRS ]  -> [ SBproxy ] -> upstream
+client -> [ nginx + ModSecurity/CRS ]  -> [ sbproxy ] -> upstream
           full CRS, anomaly scoring,      identity, keys, budgets,
           body processors, exclusions     AI routing, baseline WAF
 ```
 
 The division of labor is clean. The front WAF owns HTTP attack signatures
-and the CRS tuning loop. SBproxy owns everything the front WAF has no
+and the CRS tuning loop. sbproxy owns everything the front WAF has no
 opinion about: authentication, virtual keys, rate and spend budgets,
 provider routing, guardrails, and the audit trail. Keep the baseline WAF
 enabled behind the front one; two independent corpora are worth more than
 one, and it costs a few regexes per request.
 
-### Configure SBproxy behind it, or client IP becomes a lie
+### Configure sbproxy behind it, or client IP becomes a lie
 
 This is the part that silently breaks, so do it first.
 
-Once another proxy terminates the client connection, SBproxy's immediate
+Once another proxy terminates the client connection, sbproxy's immediate
 TCP peer is that proxy, not the client. The real address lives in
-`X-Forwarded-For`. SBproxy will not read that header from just anyone:
+`X-Forwarded-For`. sbproxy will not read that header from just anyone:
 
 ```yaml
 proxy:
@@ -196,12 +196,12 @@ proxy:
 
 Two behaviors follow from that list, and both matter.
 
-When the immediate peer **is** inside `trusted_proxies`, SBproxy walks the
+When the immediate peer **is** inside `trusted_proxies`, sbproxy walks the
 inbound `X-Forwarded-For` chain from the right and takes the first
 address that is not itself a trusted proxy. That becomes the client IP for
 the rest of the request.
 
-When the peer is **not** inside it, SBproxy strips `X-Forwarded-For`,
+When the peer is **not** inside it, sbproxy strips `X-Forwarded-For`,
 `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Forwarded-Host`,
 and `Forwarded` on ingress, along with the TLS-fingerprint and A2A
 envelope headers, so a client that reaches the proxy directly cannot name
@@ -232,7 +232,7 @@ client address.
 
 Send a request through the front WAF and confirm the access log records
 the real client address rather than the WAF's. Then send one directly to
-SBproxy's port with a forged header:
+sbproxy's port with a forged header:
 
 ```bash
 curl -i -H 'X-Forwarded-For: 203.0.113.9' http://sbproxy.internal:8080/
@@ -428,7 +428,7 @@ Three things reopen this decision.
 not "OWASP protections", but an auditor asking which CRS release is
 deployed and which paranoia level is set. Option 1 answers that today, and
 if enough deployments hit it, the useful work is a tested reference
-deployment (nginx plus Coraza plus SBproxy, as a compose file and a
+deployment (nginx plus Coraza plus sbproxy, as a compose file and a
 Kubernetes overlay) rather than an engine in our process.
 
 **Repeated demand for one attack class we keep missing.** The right

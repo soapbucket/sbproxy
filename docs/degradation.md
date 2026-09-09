@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-16*
 
-What happens when each dependency that SBproxy talks to is unavailable, and how the proxy degrades while it heals.
+What happens when each dependency that sbproxy talks to is unavailable, and how the proxy degrades while it heals.
 
 ## Principles
 
@@ -193,13 +193,13 @@ they do not enter degradation mode.
 failure bypasses the cache and fetches the response from the upstream. Unlike a
 true cache miss, the failed lookup does not retain the cache key for the
 response phase, so that request's upstream response is not written to Redis or
-to a local outage cache. When a shared rate-limit increment fails, SBproxy
+to a local outage cache. When a shared rate-limit increment fails, sbproxy
 admits the request fail-open; it does not consult a process-local token bucket.
 A local token bucket is used only when no shared store is configured. Other L2
 consumers retain their own feature-specific failure posture.
 
 A broken pooled connection is discarded. A later operation can open a fresh
-connection, so recovery does not require an SBproxy restart.
+connection, so recovery does not require an sbproxy restart.
 
 AI context summary state is intentionally different. When an AI handler selects
 `compression.state.backend: redis`, Redis is the only canonical summary store.
@@ -260,7 +260,7 @@ table, see [AI context compression](ai-context-compression.md).
 
 Request selection has no external dependency. A malformed, repeated, or
 undeclared `X-Compression` header is a caller error and returns `400` before
-cache lookup or provider dispatch. SBproxy never silently replaces a bad
+cache lookup or provider dispatch. sbproxy never silently replaces a bad
 caller override with the route default. A malformed or undeclared governed-key
 or CEL selector is an operator error; it resolves to `off`, logs the
 content-free `ai_compression_selection` event, and increments

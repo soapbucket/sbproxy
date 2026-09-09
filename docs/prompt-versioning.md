@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-25*
 
-SBproxy can publish several immutable versions of a named prompt and select one
+sbproxy can publish several immutable versions of a named prompt and select one
 by stable relative weight. Rollouts are scoped to a compiled tenant/origin,
 validated before publication, and owned by the same immutable generation as
 the AI route that consumes them. No Redis is required.
@@ -136,7 +136,7 @@ run weighted selection. This keeps the two contracts distinct:
 - The AI action's existing `prompts` store resolves and renders exact named
   templates, including runtime overlay pins.
 
-For live requests, SBproxy derives a content-free cohort key from the resolved
+For live requests, sbproxy derives a content-free cohort key from the resolved
 tenant and accountable public API-key identity. Raw request text and secret key
 material do not participate. The returned rollout content stays inside the
 request pipeline and is never copied to observability payloads.

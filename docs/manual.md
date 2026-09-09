@@ -1,10 +1,10 @@
-# SBproxy Runtime Manual
+# sbproxy Runtime Manual
 
 *Last modified: 2026-08-29*
 
 Vendor: Soap Bucket LLC - [www.soapbucket.com](https://www.soapbucket.com)
 
-This manual is the operational reference for running SBproxy in production. It covers installation, CLI usage, runtime behavior, observability, TLS, connection tuning, and deployment patterns. The proxy is built on Cloudflare's Pingora framework.
+This manual is the operational reference for running sbproxy in production. It covers installation, CLI usage, runtime behavior, observability, TLS, connection tuning, and deployment patterns. The proxy is built on Cloudflare's Pingora framework.
 
 For configuration, see [configuration.md](configuration.md). For features, see [features.md](features.md). For architecture, see [architecture.md](architecture.md). For upgrade notes, see [upgrade.md](upgrade.md).
 
@@ -1236,11 +1236,11 @@ Filter passed to `tracing-subscriber`. Accepts a bare level
 (`info`, `debug`, `trace`, `warn`, `error`) or a per-target filter
 string (`sbproxy=debug,h2=warn,pingora=info`).
 
-The official release binary has a compile-time maximum of `info` for SBproxy's
-own tracing calls, so `debug` and `trace` cannot restore SBproxy events that
+The official release binary has a compile-time maximum of `info` for sbproxy's
+own tracing calls, so `debug` and `trace` cannot restore sbproxy events that
 were removed at compile time. Dependencies built without that ceiling may
 still emit at those levels. Use a development build (`cargo build`) when you
-need SBproxy-internal debug or trace events.
+need sbproxy-internal debug or trace events.
 
 - **Default:** `info`.
 - **Priority:** `--log-level` > `SB_LOG_LEVEL` > `RUST_LOG` >
@@ -1311,7 +1311,7 @@ sbproxy --config sb.yml --shutdown-grace-ms 30000
 SBPROXY_SHUTDOWN_GRACE_MS=60000 sbproxy --config sb.yml
 ```
 
-When SBproxy receives SIGTERM or SIGINT it emits a structured
+When sbproxy receives SIGTERM or SIGINT it emits a structured
 `shutdown_signal_received` tracing event that includes the resolved
 grace budget so operators can confirm the drain started before the
 orchestrator's hard kill.
@@ -1380,7 +1380,7 @@ by the current binary:
 
 ### CPU detection
 
-SBproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honors cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. To override (pin a benchmark to a known worker count, or cap workers below the cgroup quota), set `SB_WORKER_THREADS` to a positive integer:
+sbproxy sizes its Pingora worker pool to `std::thread::available_parallelism()`, which honors cgroup CPU quotas on Linux. In a container with a 2-CPU quota, the proxy spawns workers that match the actual available CPU capacity instead of getting throttled. To override (pin a benchmark to a known worker count, or cap workers below the cgroup quota), set `SB_WORKER_THREADS` to a positive integer:
 
 ```bash
 SB_WORKER_THREADS=4 sbproxy --config sb.yml
@@ -1392,7 +1392,7 @@ In environments without cgroup CPU quotas (bare metal, macOS), the proxy falls b
 
 ### Worker stack size
 
-Each Pingora worker polls the whole request path on one stack: the request filter, the module chain, the AI dispatch, the streaming relay, and every future they await are all live frames while a request is in flight. SBproxy gives each worker 8 MiB, which is the same size Linux gives a process's main thread by default. Override it with `SB_WORKER_STACK_BYTES`:
+Each Pingora worker polls the whole request path on one stack: the request filter, the module chain, the AI dispatch, the streaming relay, and every future they await are all live frames while a request is in flight. sbproxy gives each worker 8 MiB, which is the same size Linux gives a process's main thread by default. Override it with `SB_WORKER_STACK_BYTES`:
 
 ```bash
 SB_WORKER_STACK_BYTES=16777216 sbproxy --config sb.yml
@@ -1411,7 +1411,7 @@ There is no equivalent config key or CLI flag; this is an environment-only knob 
 
 ### Startup sequence
 
-SBproxy initializes subsystems in a fixed order. A config or pipeline
+sbproxy initializes subsystems in a fixed order. A config or pipeline
 compile error aborts startup; most optional subsystems (telemetry, key
 plane, pipeline lifecycle hooks) log and degrade instead of blocking.
 
@@ -1470,7 +1470,7 @@ INFO starting sbproxy on 0.0.0.0:8080
 | `SIGINT` (Ctrl+C) | Fast shutdown (drop in-flight requests immediately) |
 | `SIGHUP` | Full config reload: recompile the YAML and hot-swap the pipeline |
 
-Pingora handles SIGTERM and SIGINT itself; SBproxy subscribes to the
+Pingora handles SIGTERM and SIGINT itself; sbproxy subscribes to the
 server's execution-phase broadcast and mirrors each phase into
 structured tracing events (`shutdown_signal_received` on a graceful
 SIGTERM, then `shutdown_started`, `shutdown_grace_period`,
@@ -1479,7 +1479,7 @@ confirm the drain started and finished.
 
 ### Graceful shutdown
 
-On `SIGTERM`, SBproxy proceeds as follows:
+On `SIGTERM`, sbproxy proceeds as follows:
 
 1. The `shutdown_signal_received` event is logged with
    `signal=SIGTERM` and the resolved `grace_seconds` budget.
@@ -1501,7 +1501,7 @@ On `SIGINT`, Pingora skips the grace window and tears down listeners immediately
 
 ### One subscriber, two targets
 
-SBproxy logs through a single `tracing` subscriber. Application events
+sbproxy logs through a single `tracing` subscriber. Application events
 (lifecycle, config, errors) go to the default targets; per-request
 access-log lines go to the dedicated `access_log` target so log
 routers can split the two without extra plumbing.
@@ -1642,7 +1642,7 @@ scrape_configs:
 
 ### OpenTelemetry tracing
 
-SBproxy exports distributed traces via OTLP. Configure in `sb.yml`:
+sbproxy exports distributed traces via OTLP. Configure in `sb.yml`:
 
 ```yaml
 proxy:
@@ -1684,7 +1684,7 @@ hot-reload workflow.
 
 ## 6. Health checks
 
-SBproxy serves probe endpoints on two listeners. The main data plane
+sbproxy serves probe endpoints on two listeners. The main data plane
 (`http_bind_port`, default `8080`) serves `/metrics` and keeps a minimal
 `/health` compatibility response for requests whose `Host` does not match a
 configured origin. A matched origin owns `/health` like every other route, so
@@ -1849,7 +1849,7 @@ defaults apply.
 
 ### ACME auto-TLS
 
-SBproxy works with any ACME-compatible certificate authority; the
+sbproxy works with any ACME-compatible certificate authority; the
 default directory is Let's Encrypt production. Certificates are issued
 per hostname in the config, stored in the configured backing store,
 and renewed automatically. Until the first issuance completes, the
@@ -1900,7 +1900,7 @@ Ingress instead of enabling this block. See
 ### OCSP stapling
 
 Stapling reaches one certificate, the manual fallback loaded from
-`tls_cert_file`. With that pair configured, SBproxy fetches an OCSP
+`tls_cert_file`. With that pair configured, sbproxy fetches an OCSP
 response for it at startup, refreshes every 12 hours, and attaches the
 result to the fallback certificate so later handshakes carry it.
 
@@ -1942,7 +1942,7 @@ a handshake. A response a client cannot tie to the certificate in
 front of it is worse than no response at all, because a client that
 checks the staple rejects a certificate that is otherwise valid.
 
-What SBproxy does not check is the responder's own signature. A client
+What sbproxy does not check is the responder's own signature. A client
 that reads the staple verifies that itself against the issuer, so a
 forged response cannot make a revoked certificate look good. What it
 can do is cost connections to the clients that check, which is why the
@@ -1957,7 +1957,7 @@ Two metrics report the state:
 
 ### Mutual TLS (mTLS) for inbound connections
 
-To require clients to present certificates when connecting to SBproxy,
+To require clients to present certificates when connecting to sbproxy,
 add a `proxy.mtls` block. It applies to the HTTPS listener (manual
 certs or ACME) and requires `https_bind_port`:
 
@@ -2045,7 +2045,7 @@ proxy:
 
 ### File watcher
 
-SBproxy watches the directory containing the configuration file via `notify`, rather than the file itself, so an atomic-rename save or a Kubernetes ConfigMap symlink swap is still seen. Watching the directory also means every unrelated file in it reports an event, so two things decide whether a reload actually happens.
+sbproxy watches the directory containing the configuration file via `notify`, rather than the file itself, so an atomic-rename save or a Kubernetes ConfigMap symlink swap is still seen. Watching the directory also means every unrelated file in it reports an event, so two things decide whether a reload actually happens.
 
 A save arrives as a burst of events, not one event, so the watcher waits for the burst to go quiet (250 ms, capped at 2 seconds for a directory that never goes quiet) before reading. Back-to-back editor writes therefore coalesce into a single reload rather than one apiece, and the read sees a finished file rather than one still being written.
 
@@ -2275,7 +2275,7 @@ set that command.
 
 ### Deployment and Service
 
-A minimal Deployment and Service for SBproxy. Prometheus scrapes `/metrics` on the main HTTP port.
+A minimal Deployment and Service for sbproxy. Prometheus scrapes `/metrics` on the main HTTP port.
 
 ```yaml
 apiVersion: apps/v1
@@ -2532,7 +2532,7 @@ In addition, the standard `RUST_LOG` env var is honored when neither
 
 ### OpenTelemetry configuration
 
-SBproxy does not read the standard `OTEL_*` SDK environment variables.
+sbproxy does not read the standard `OTEL_*` SDK environment variables.
 The OTLP exporter (endpoint, transport, service name, sampling,
 resource attributes) is configured entirely in YAML under
 `proxy.observability.telemetry`; see

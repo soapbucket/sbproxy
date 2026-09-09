@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-SBproxy can transform an AI chat request through an ordered, route-local
+sbproxy can transform an AI chat request through an ordered, route-local
 compression pipeline before provider selection and dispatch. A route can keep
 one default pipeline and declare named profiles for different callers. Use
 the retrieval-aware stateless levers for explicitly marked context. The
@@ -19,13 +19,13 @@ runtime behavior, state, degradation, and telemetry.
 
 ## Runtime contract
 
-Each `ai_proxy` action can declare one `compression.levers` array. SBproxy runs
+Each `ai_proxy` action can declare one `compression.levers` array. sbproxy runs
 the entries in declaration order against one working message list:
 
 1. A lever sees the output committed by earlier levers.
 2. `summary_buffer`, `window_fit`, `token_prune`, `query_select`, `rag_select`,
    and `compact_serialization` replace the working list only when the candidate
-   strictly reduces SBproxy's token estimate for the effective model.
+   strictly reduces sbproxy's token estimate for the effective model.
    `position_reorder` may commit a changed, non-expanding candidate.
 3. A skipped or failed lever leaves the working list unchanged.
 4. Later levers still run after a skip or failure.
@@ -45,7 +45,7 @@ followed by `window_fit`. These can be separate named profiles on one route.
 | `summary_buffer` | Local by default; explicit Redis or mesh | Replace eligible older text history with a bounded, incremental summary | First |
 | `rag_select` | None | Retain the most relevant chunks in explicitly marked retrieval blocks | Before serialization |
 | `query_select` | None | Retain query-related sentences and place the strongest retained chunks at block edges | Before token pruning |
-| `token_prune` | None in SBproxy; ONNX model in the classifier sidecar | Remove lower-value source tokens from marked text chunks | After sentence selection |
+| `token_prune` | None in sbproxy; ONNX model in the classifier sidecar | Remove lower-value source tokens from marked text chunks | After sentence selection |
 | `compact_serialization` | None | Compact safe marked JSON and uniform scalar object rows | After selection |
 | `position_reorder` | None | Move highly ranked chunks toward block edges | Before the final bound |
 | `window_fit` | None | Apply the legacy newest-to-oldest message-selection heuristic within the known model window | Last |
@@ -84,7 +84,7 @@ original messages are not stored in the record.
 
 `token_prune`, `query_select`, `rag_select`, `compact_serialization`, and
 `position_reorder` inspect only string-valued `content` on `user` and `tool`
-messages. Callers must mark the retrieval context explicitly. SBproxy does not
+messages. Callers must mark the retrieval context explicitly. sbproxy does not
 infer it from ordinary text, and it ignores marker-like strings in `system`,
 `developer`, or `assistant` messages.
 
@@ -198,7 +198,7 @@ Choose exactly one bound:
 
 `max_sentences` accepts from 1 through 4,096. `target_tokens` accepts from 1
 through 1,000,000. Each configured bound applies independently to each marked
-block. In either mode, SBproxy processes at most 4,096 source sentences in one
+block. In either mode, sbproxy processes at most 4,096 source sentences in one
 block. A larger block skips the whole lever as `marked_context_too_large`
 before ranking and leaves its input unchanged. The token form counts selected
 sentence bodies, including one separator between sentences retained from the
@@ -222,7 +222,7 @@ still runs against the unchanged input.
 `token_prune` sends marked `format="text"` chunk bodies to the classifier
 sidecar's `Compress` RPC. The sidecar runs an operator-supplied
 LLMLingua-2-compatible token classifier and returns text assembled from source
-spans. SBproxy validates the returned counts, checks that the text is
+spans. sbproxy validates the returned counts, checks that the text is
 extractive, and remeasures the complete candidate before it can commit.
 
 ```yaml
@@ -261,10 +261,10 @@ target:
 ```
 
 `retain_percent` accepts from 1 through 99. In ratio mode, the sidecar applies
-the percentage to each chunk using its pruning tokenizer. SBproxy then counts
+the percentage to each chunk using its pruning tokenizer. sbproxy then counts
 each returned chunk with the request's target model and rejects any chunk over
 the same percentage of its original target-model estimate. In `target_tokens`
-mode, SBproxy divides the aggregate budget across chunks in proportion to their
+mode, sbproxy divides the aggregate budget across chunks in proportion to their
 target-model estimates, sends those allocations to the sidecar, then counts
 all returned bodies again with the request's target model. The lever fails
 open when either target check fails. Each chunk needs an allocation of at
@@ -324,7 +324,7 @@ literal-tab-separated rows of canonical JSON scalars:
 JSON escaping protects tabs, newlines, quotes, and backslashes inside string
 cells. The public `decode_sbproxy_table_v1` decoder reconstructs the exact
 `serde_json::Value`. Insignificant source whitespace and object-key order are
-not preserved. SBproxy chooses the smallest safe representation and commits it
+not preserved. sbproxy chooses the smallest safe representation and commits it
 only when the complete message list strictly shrinks by the shared estimate.
 
 ### Position reordering
@@ -369,13 +369,13 @@ origins:
             input_budget_tokens: 8192
 ```
 
-The completion reserve defaults to `1024`. In explicit-budget mode, SBproxy
+The completion reserve defaults to `1024`. In explicit-budget mode, sbproxy
 counts the complete JSON message shape, including provider-specific fields.
 It preserves the contiguous leading `system` and `developer` instruction
 prefix, requires the complete newest protocol unit to fit, and retains a
 contiguous newest suffix. OpenAI assistant tool calls stay grouped with their
 `tool` or `function` results. Anthropic assistant `tool_use` blocks stay grouped
-with the following user `tool_result` blocks. SBproxy never retains half of a
+with the following user `tool_result` blocks. sbproxy never retains half of a
 tool exchange or drops the current turn while keeping stale history.
 
 If the protected prefix plus newest unit cannot fit, the lever skips as
@@ -437,12 +437,12 @@ One request resolves exactly one selector in this precedence order:
 3. CEL action `compression:<selector>`.
 4. Route default, equivalent to `on`.
 
-The request header is the caller override. SBproxy accepts exactly one header
+The request header is the caller override. sbproxy accepts exactly one header
 value, strips it before upstream dispatch, and returns `400` for malformed
 syntax or an undeclared header profile. The governed-key Admin API and static
 configuration reject malformed selector syntax when it is written. If a
 legacy or externally modified governed record contains a malformed or
-undeclared selector, SBproxy disables compression for that request and records
+undeclared selector, sbproxy disables compression for that request and records
 `invalid_operator`. CEL uses the same safe operator behavior: a malformed or
 undeclared compression action resolves to `off`, while unrelated CEL errors
 still follow `ai_policy.on_error`.
@@ -462,7 +462,7 @@ curl -H 'X-Compression: compact' ...
 
 `summary_buffer` is eligible only for a supported `/v1/chat/completions`
 message array with a non-empty effective model, captured session ID, tenant,
-and origin. It runs when SBproxy's model-aware estimate reaches `min_tokens`
+and origin. It runs when sbproxy's model-aware estimate reaches `min_tokens`
 and enough eligible history remains after the protected prefix and recent tail
 are excluded.
 
@@ -530,7 +530,7 @@ origin, and captured session:
 - A record at or past its logical expiration skips with `state_expired`, even
   during the short interval before the selected backend physically removes it.
 - A changed protected prefix, edited covered message, shortened history, or
-  different history fork skips with `branch_mismatch`. SBproxy does not reuse
+  different history fork skips with `branch_mismatch`. sbproxy does not reuse
   or overwrite the record for the mismatched branch.
 
 Treat a deliberate conversation fork as a new session. If a caller reused a
@@ -614,7 +614,7 @@ after every Local `summary_buffer` policy is removed; a missing dormant path is
 never created just for Admin.
 
 Local is a one-process durability boundary. Do not place its file on a shared
-network mount or point several SBproxy processes at it; use Redis or mesh for a
+network mount or point several sbproxy processes at it; use Redis or mesh for a
 fleet. Within one process, redb transactions, persisted leases, monotonic
 fences, and logical-version compare-and-set serialize updates. A
 crash-held lease expires after its bounded lease time (the summarizer timeout
@@ -699,7 +699,7 @@ or command failure makes the stateful lever fail open for that request. The
 current internal bounds are 500 milliseconds for connection setup, 1 second
 for a command response, and 2 seconds for a complete state operation. A failed
 cached connection is replaced, and a later request can recover without
-restarting SBproxy. There is no worker-local summary fallback.
+restarting sbproxy. There is no worker-local summary fallback.
 
 The general synchronous L2 metrics named `sbproxy_redis_kv_*` cover
 `RedisKVStore` consumers such as shared response cache and rate limiting. The
@@ -844,7 +844,7 @@ fleet pagination.
 ## Semantic cache interaction
 
 Semantic-cache keys do not currently partition entries by compression
-behavior. SBproxy therefore bypasses both semantic-cache implementations before
+behavior. sbproxy therefore bypasses both semantic-cache implementations before
 lookup whenever request-time selection could change the prompt. The same
 decision prevents write-back after an upstream response.
 
@@ -950,7 +950,7 @@ The request outcome is failure-first:
 
 ## Metrics
 
-All token measurements use the same target-model SBproxy counter at the runner
+All token measurements use the same target-model sbproxy counter at the runner
 boundary. The strict levers apply only when `after_tokens < before_tokens`.
 `position_reorder` can apply when the messages changed and
 `after_tokens == before_tokens`; it reports zero saved tokens. Skipped and
@@ -975,7 +975,7 @@ double-counted in the request distribution.
 |---|---|---|---|
 | `sbproxy_ai_compression_lever_total` | Counter | `tenant_id`, `api_key_id`, `lever`, `outcome`, `reason`, `backend` | One row per lever invocation |
 | `sbproxy_ai_compression_tokens_total` | Counter | `tenant_id`, `api_key_id`, `lever`, `direction` | Applied-lever tokens with `direction="input"` or `"output"` |
-| `sbproxy_ai_compression_tokens_saved_total` | Counter | `tenant_id`, `api_key_id`, `lever` | Applied reduction in SBproxy's model-aware token estimate per lever |
+| `sbproxy_ai_compression_tokens_saved_total` | Counter | `tenant_id`, `api_key_id`, `lever` | Applied reduction in sbproxy's model-aware token estimate per lever |
 | `sbproxy_ai_compression_ratio` | Histogram | `tenant_id`, `api_key_id`, `lever` | Applied `after_tokens / before_tokens` |
 | `sbproxy_ai_compression_duration_seconds` | Histogram | `tenant_id`, `api_key_id`, `lever`, `outcome`, `backend` | Wall-clock duration of every lever invocation |
 | `sbproxy_ai_compression_requests_total` | Counter | `tenant_id`, `api_key_id`, `outcome`, `backend`, `cache_bypass` | One row per executed non-empty compression pipeline |
@@ -1293,8 +1293,8 @@ active origin opt-in. To keep only stateless protection, remove
 configured. A stateless-only process does not create a Local database. A newly
 committed summary refreshes its TTL, while an exact-summary reuse does not.
 
-SBproxy has no OmniRoute runtime dependency, compatibility layer, state import,
-or migration path for context compression. Configure SBproxy policies directly
+sbproxy has no OmniRoute runtime dependency, compatibility layer, state import,
+or migration path for context compression. Configure sbproxy policies directly
 and begin with fresh external summary state.
 
 ## See also

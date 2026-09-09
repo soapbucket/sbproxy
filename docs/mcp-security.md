@@ -14,7 +14,7 @@ the whole problem in one sentence, and it is why a gateway in the path is worth
 having.
 
 This page walks the threat classes that show up in MCP deployments, what
-SBproxy does about each, and where it stops. The last part matters as much as
+sbproxy does about each, and where it stops. The last part matters as much as
 the first. A control you think you have is worse than one you know you lack.
 
 For the general picture across all traffic types, start at
@@ -523,7 +523,7 @@ control entirely; keeping the launched command honest is a supply-chain
 problem, not a config one. Without an `egress:` block at all (the legacy
 default, `mode: allow_by_default`), any server dials its origin unchecked,
 same as before this control existed; the sighting inventory still records the
-dial as `ungated` rather than staying silent about it. SBproxy also does not
+dial as `ungated` rather than staying silent about it. sbproxy also does not
 implement per-upstream certificate pinning. TLS validation is standard chain
 validation. If you need to pin a specific key for an upstream, that is not
 available here today.
@@ -706,7 +706,7 @@ whatever governance you put in the path. You find out later.
 
 **What the gateway does.** Less than you might hope, and this is the category
 where a proxy is weakest. It is a choke-point architecture rather than a
-feature: if agent traffic is required to egress through SBproxy, an unsanctioned
+feature: if agent traffic is required to egress through sbproxy, an unsanctioned
 server is one that egress policy refuses.
 
 **Still yours.** Making the gateway the only route out. That is network design,

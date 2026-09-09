@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-A canonical ClickHouse schema for the SBproxy access log, plus sample queries for the three reports an operator most often wants: monthly project cost, top users by token spend, and tag-level burndown against a budget. The schema mirrors the JSON shape emitted by the structured logger (`sbproxy-observe::access_log::AccessLogEntry`), so a Vector / Fluent Bit pipeline can ingest the proxy's stdout into ClickHouse without an intermediate transform.
+A canonical ClickHouse schema for the sbproxy access log, plus sample queries for the three reports an operator most often wants: monthly project cost, top users by token spend, and tag-level burndown against a budget. The schema mirrors the JSON shape emitted by the structured logger (`sbproxy-observe::access_log::AccessLogEntry`), so a Vector / Fluent Bit pipeline can ingest the proxy's stdout into ClickHouse without an intermediate transform.
 
 This guide assumes a recent ClickHouse (v24.3 or newer; `JSONEachRow` and `TIMESTAMP` semantics are unchanged across the LTS line). The schema uses `MergeTree` for the raw rows and `AggregatingMergeTree` for the materialized pre-aggregations.
 

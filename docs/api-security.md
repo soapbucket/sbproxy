@@ -7,7 +7,7 @@ was asking, a limit nobody set, or a field that was never supposed to be
 writable. A gateway is a good place to fix that class of problem, because it
 sits in front of every route whether or not the service behind it remembered.
 
-This page covers the API threat classes SBproxy can act on, the configuration
+This page covers the API threat classes sbproxy can act on, the configuration
 for each, and the parts that stay with the service. For MCP and agent traffic,
 see [mcp-security.md](mcp-security.md). For the whole picture, start at
 [security.md](security.md).
@@ -65,7 +65,7 @@ The oldest and most common API flaw: `GET /orders/1042` returns order 1042 to
 whoever asks, because the handler checked that you are logged in and not that
 the order is yours.
 
-SBproxy enforces object-level authorization at the edge, so the check exists
+sbproxy enforces object-level authorization at the edge, so the check exists
 even when the handler forgot.
 
 <!-- sbproxy-config-excerpt -->
@@ -119,7 +119,7 @@ service remains the authority.
 Bearer tokens with no audience check, JWTs validated against the wrong issuer,
 a session cookie that survives logout. Each is ordinary and each is enough.
 
-SBproxy ships auth providers rather than an auth framework, so the choice is
+sbproxy ships auth providers rather than an auth framework, so the choice is
 which one to attach:
 
 <!-- sbproxy-config-excerpt -->
@@ -258,7 +258,7 @@ elements the whole document holds. A parser-stressing payload is a shape
 problem before it is a content problem, and shape limits are immune to the
 encoding evasions a signature ruleset has to chase. Kong gates the equivalent
 capability (its JSON Threat Protection and XML Threat Protection plugins)
-behind its Enterprise tier; SBproxy ships it in OSS.
+behind its Enterprise tier; sbproxy ships it in OSS.
 
 <!-- sbproxy-config-excerpt -->
 ```yaml

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-09-08*
 
-SBproxy can own model processes on one worker or place them across a managed
+sbproxy can own model processes on one worker or place them across a managed
 cluster. Model-host control lives under `proxy.model_host`. Depending on its
 authority mode, desired deployments come from that file block, the durable
 admin store, or a signed cluster bundle. An AI provider with
@@ -22,12 +22,12 @@ facts, health, execution identity, and bounded failure reporting.
 `sb-runtime-host` optionally adds typed driver envelopes, tokenized process
 execution, loopback readiness, explicit-directory native process ownership,
 and retry/crash-loop supervision. The host crate depends on the core crate and
-does not depend on SBproxy.
+does not depend on sbproxy.
 
 The `sbproxy-model-host` crate consumes the optional host layer while retaining
 catalog and artifact trust, engine argv templates and allowlists, fit and
 placement, durable operation jobs, admission, routing, policy, telemetry, and
-cluster authority. It also resolves SBproxy's process-ownership directory
+cluster authority. It also resolves sbproxy's process-ownership directory
 before passing that explicit path into the neutral host. Existing model-host
 import paths remain available as compatibility re-exports and adapters.
 
@@ -201,7 +201,7 @@ Production mode requires mTLS plus a separate authenticated gossip key. Shared
 key mode must set `development: true` and is for local fixtures only. Canonical
 mTLS supports built-in enrollment and operator-managed PKI. Enrolled identities
 carry an authority-signed manifest; manual-PKI identities carry the same strict
-claims in an SBproxy URI SAN. Every leaf carries its unique node ID as a DNS
+claims in an sbproxy URI SAN. Every leaf carries its unique node ID as a DNS
 SAN, and outbound transport verifies that node ID. A cluster must use one
 attestation mode consistently.
 
@@ -252,7 +252,7 @@ production mTLS clusters use `fallback`, while development and non-clustered
 runtimes use `wait`. Admin-managed and cluster-authority deployments must set
 `cold_start` explicitly. A retryable candidate failure may move to another
 current replica only before response headers reach the client. Once a stream
-begins, SBproxy relays partial output and never replays the request. A partial
+begins, sbproxy relays partial output and never replays the request. A partial
 SSE stream closes without `data: [DONE]`. Dropping the client response drops
 the peer and engine streams and releases the admission permit.
 
@@ -343,7 +343,7 @@ them.
 
 Manual PKI is a production canonical-cluster option when an external CA owns
 issuance. The leaf certificate must have a DNS SAN equal to `node_id` and
-exactly one SBproxy identity URI SAN:
+exactly one sbproxy identity URI SAN:
 
 ```text
 urn:sbproxy:identity:v1:<base64url-without-padding-of-json>
@@ -360,7 +360,7 @@ URI and `DNS:worker-a` to the CA-signed leaf, and configure the certificate,
 key, and CA paths normally. Leave `identity.json` and
 `authority-verifying.key` absent from `state_dir`; having only one is a startup
 error. All nodes must use manual PKI, and rotation for the same node ID must
-increment `identity_epoch`. SBproxy verifies the CA chain, expiry, node DNS
+increment `identity_epoch`. sbproxy verifies the CA chain, expiry, node DNS
 SAN, identity URI, configured claims, and proof of key possession.
 
 Runnable templates are in
@@ -393,7 +393,7 @@ runtime candidate is prepared.
 
 The model-management UI never rewrites `sb.yml`. In `file_managed` mode it
 disables persistent Add, Edit, and Remove controls and instructs the operator to
-edit `proxy.model_host.deployments` in `sb.yml`, then reload SBproxy. Use either
+edit `proxy.model_host.deployments` in `sb.yml`, then reload sbproxy. Use either
 of these explicit reload paths after saving the file:
 
 ```bash
@@ -408,7 +408,7 @@ The file watcher and SIGHUP use the same prepare-and-commit transaction.
 Lifecycle actions remain available for deployments already defined by the
 file. Parse, validation, and preparation failures happen before runtime or
 request-pipeline publication. A later activation failure can occur after a
-recreate rollout has stopped an old generation. SBproxy attempts to restore
+recreate rollout has stopped an old generation. sbproxy attempts to restore
 that generation, but restoration can fail and leave the current runtime
 degraded. Inspect model-host status and logs, correct `sb.yml` or its runtime
 dependencies, and reload again. Restart only after the authoritative file is
@@ -660,7 +660,7 @@ cluster plan locally and marks the verified bundle active.
 
 Runtime preparation or commit can fail after generation fences and the cursor
 advance. The previous runtime may remain active, but those durable markers stay
-advanced. If activation stopped a recreate generation, SBproxy attempts to
+advanced. If activation stopped a recreate generation, sbproxy attempts to
 restore it. A failed restore leaves the worker degraded. Use cluster status,
 model-host status, and logs to choose an authority-specific recovery.
 
@@ -858,7 +858,7 @@ Both lanes land under the model the caller asked for, not under the id the
 provider that answered billed as. That is the only key the two halves share,
 and it is what lets one row say what a model cost you across both lanes.
 A model without a `reference` is absent from the split entirely, in both
-directions: SBproxy makes no savings claim it cannot price.
+directions: sbproxy makes no savings claim it cannot price.
 
 Compression does not count as a local or cloud completion. The request path
 records it only after the terminal provider attempt returns a billable `2xx`.
@@ -870,7 +870,7 @@ Each `compression` row names the target `model`, closed `lever`,
 total.
 
 The precision value is `model_tokenizer` when the target model resolves to a
-registered tokenizer, or `heuristic` when SBproxy uses its UTF-8 byte-length
+registered tokenizer, or `heuristic` when sbproxy uses its UTF-8 byte-length
 fallback. Unknown input pricing yields zero gross cost and keeps the token
 saving. The amount is gross because dedicated summarizer spend remains in the
 normal usage stream instead of being silently netted out.
@@ -1044,7 +1044,7 @@ explicit `version:` always wins over this selection, so only pin one on macOS
 if you know the build loads on the hosts you deploy to.
 
 llama.cpp is the engine for GGUF models on CPU and Apple Metal. On a compatible
-NVIDIA Linux host, SBproxy can also build llama.cpp from digest-pinned source
+NVIDIA Linux host, sbproxy can also build llama.cpp from digest-pinned source
 with CUDA. The pending NVIDIA certification target uses vLLM or SGLang, so use
 one of those when following the certification procedure.
 
@@ -1066,7 +1066,7 @@ The image ships the whole CUDA and Python toolchain, so the host needs nothing
 beyond a container runtime and an NVIDIA driver, and there is no host build
 cascade to hit. This is the default: when the worker has a container runtime
 (Docker or Podman) and you have not configured vLLM provisioning yourself,
-SBproxy runs vLLM from a curated digest-pinned image. The smallest useful
+sbproxy runs vLLM from a curated digest-pinned image. The smallest useful
 config names no image at all and still serves in a container.
 
 Container mode accepts only an immutable `repository@sha256:<digest>` image.

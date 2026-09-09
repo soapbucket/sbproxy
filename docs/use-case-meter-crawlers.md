@@ -4,7 +4,7 @@
 
 ![An unsigned crawler gets 401, a signed crawler gets a 402 price challenge, a payment token redeems once for a 200, and the replay is charged again](assets/use-case-meter-crawlers.gif)
 
-GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 70 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
+GPTBot, ClaudeBot, and PerplexityBot are in your access logs right now, pulling pages your team paid to produce. The usual response is a robots.txt entry or an outright block, which forfeits the one useful thing about this traffic: AI vendors will pay for licensed content when there is a machine-readable way to charge them. sbproxy's pitch is "Call any model. Serve your own. Govern both.", and this guide is the govern half pointed at inbound traffic. The same Apache-2.0 binary that routes chat completions to 70 providers, or serves weights on your own GPUs, stands in front of your site, checks each crawler's cryptographic identity, quotes a price per fetch, and answers with HTTP 402 until a payment token arrives.
 
 ## What you will build
 
@@ -32,7 +32,7 @@ This walkthrough uses the Apache-2.0 code in this repository. It covers 402 chal
 - The `sbproxy` binary (next section).
 - `curl` for sending requests and `jq` for pretty-printing JSON.
 - `openssl`, used by the bundled signing helper to produce Ed25519 signatures.
-- A checkout of the SBproxy repository, for the example config and the signing helper at `examples/web-bot-auth/bin/sign-request.sh`.
+- A checkout of the sbproxy repository, for the example config and the signing helper at `examples/web-bot-auth/bin/sign-request.sh`.
 - No provider API keys. The demo upstream is the public echo service at `test.sbproxy.dev`.
 
 ## Install
@@ -186,7 +186,7 @@ Note that the replayed request reused the same signature headers and still passe
 
 ## Next steps
 
-- [web-bot-auth.md](web-bot-auth.md) covers the verifier in depth: verdicts, `content-digest` body binding, and publishing your own signing directory when SBproxy is the crawler.
+- [web-bot-auth.md](web-bot-auth.md) covers the verifier in depth: verdicts, `content-digest` body binding, and publishing your own signing directory when sbproxy is the crawler.
 - [ai-crawl-control.md](ai-crawl-control.md) grows the flat price into tiers by route and content shape, per-vendor pricing through agent classes, and the HTTPS ledger with its retry and circuit-breaker rules.
 - [402-challenge.md](402-challenge.md) is the wire contract: single-rail and multi-rail challenge bodies, quote tokens, the 406 fallback, and Cloudflare Pay Per Crawl interop via `cloudflare_compat: true`.
 - [rsl.md](rsl.md) and [content-for-agents.md](content-for-agents.md) advertise your terms so cooperative crawlers can discover them without a 402 round-trip: `/licenses.xml`, `robots.txt`, `llms.txt`, TDMRep, and Markdown or JSON projections of your pages.

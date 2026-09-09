@@ -1,4 +1,4 @@
-# SBproxy threat model
+# sbproxy threat model
 
 *Last modified: 2026-08-28*
 
@@ -26,7 +26,7 @@ of each implementation wave.
 
 ```mermaid
 flowchart TD
-    Client[Client] -->|untrusted headers + bodies| Proxy[SBproxy]
+    Client[Client] -->|untrusted headers + bodies| Proxy[sbproxy]
     Proxy -->|policy-filtered requests only| Origin[Upstream origin]
     Proxy -->|admin auth + network placement| Admin["Admin API (/admin/*)"]
     Proxy -->|redaction before fan-out| Obs["Observability sinks (logs, traces, metrics)"]
@@ -52,7 +52,7 @@ compensates.
   allow.
 - **Build supply chain:** the reproducible-build probe is informational until
   binary diffs are driven to zero.
-- **Upstream TLS verification:** SBproxy relies on the rustls verifier
+- **Upstream TLS verification:** sbproxy relies on the rustls verifier
   defaults that ship with Pingora, validating upstream certificates against
   the system CA bundle in the runtime image. Pin-by-SPKI is not implemented.
   Operators who need stricter assurance for sensitive upstreams should
@@ -131,7 +131,7 @@ compensates.
   provider that skips the proxy entirely is invisible to every egress
   control above: the authorizer, the DNS pinning, the per-purpose
   inventory. None of it sees a request it was never handed. Closing
-  that gap is a deployment decision, not something SBproxy configures
+  that gap is a deployment decision, not something sbproxy configures
   for you, and three things help. A network egress policy (a
   Kubernetes NetworkPolicy, a cloud security group, a host firewall
   rule) that permits outbound HTTPS to AI provider hosts only from the
@@ -145,7 +145,7 @@ compensates.
   or a bypassed network policy still cannot reach the provider from
   anywhere but the gateway's own address.
 
-  What SBproxy adds is detection after the fact. `sbproxy ai ledger
+  What sbproxy adds is detection after the fact. `sbproxy ai ledger
   reconcile` compares the gateway's own usage ledger against a usage
   export downloaded directly from the provider, per day and model, and
   flags provider-billed usage the ledger never recorded, exactly the
@@ -195,7 +195,7 @@ compensates.
 
 ## Examples in Practice
 
-To explore SBproxy's security model in action, see the following examples:
+To explore sbproxy's security model in action, see the following examples:
 
 | Example | What it is | How to use it | Outcome |
 |---------|------------|---------------|---------|

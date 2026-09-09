@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-29*
 
-SBproxy ships an MCP (Model Context Protocol) gateway that speaks
+sbproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
 and the proxy serves the MCP method set (`initialize`, `tools/list`,
 `tools/call`, `resources/list`, `resources/read`, `prompts/list`,
@@ -715,7 +715,7 @@ The `tools` list is the same per-caller view `tools/list` would return: the
 `tool_allowlist` guardrail and the calling principal's per-server RBAC policy
 both filter it, so the manifest never names a tool the gateway would refuse
 to call for that caller. `dnsDiscovery` is always present and is a
-recommendation, not a claim: SBproxy serves HTTP, not DNS, so it advertises
+recommendation, not a claim: sbproxy serves HTTP, not DNS, so it advertises
 the `_mcp.{domain}` TXT record an operator can publish in their own zone
 (`draft-morrison-mcp-dns-discovery` style) rather than publishing it itself.
 When the action declares `oauth:`, the manifest also carries an
@@ -1266,7 +1266,7 @@ for the tradeoff and [events.md](events.md) for the event shape.
 
 ## Session ledger
 
-SBproxy sits on the `tools/call` path, so it can record what an agent
+sbproxy sits on the `tools/call` path, so it can record what an agent
 did at the tool boundary, which tools, in what order, with what
 arguments, instead of leaving you to reconstruct it from a transcript.
 With the ledger enabled, each call appends one record to a session

@@ -1,8 +1,8 @@
-# Manage SBproxy over MCP
+# Manage sbproxy over MCP
 
 *Last modified: 2026-08-08*
 
-SBproxy can serve its own admin API as MCP tools. Point an MCP client
+sbproxy can serve its own admin API as MCP tools. Point an MCP client
 such as Claude Code or Cursor at the gateway and the agent can check
 health, read the running config, and inspect spend by calling
 `sbproxy.get_health` or `sbproxy.get_config` instead of you shelling

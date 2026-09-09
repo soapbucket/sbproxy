@@ -4,7 +4,7 @@
 
 ## What you will build
 
-You will put SBproxy in front of a set of existing HTTP APIs as a reverse proxy, with one origin per public hostname. The gateway matches the inbound `Host` header, forwards the request to the right upstream, and applies a layer of governance on the way through: a bearer-token allowlist, a per-IP rate limit, and request and response header rewrites. The result is a single edge that every caller goes through, so authentication and traffic policy live in config rather than in each backend.
+You will put sbproxy in front of a set of existing HTTP APIs as a reverse proxy, with one origin per public hostname. The gateway matches the inbound `Host` header, forwards the request to the right upstream, and applies a layer of governance on the way through: a bearer-token allowlist, a per-IP rate limit, and request and response header rewrites. The result is a single edge that every caller goes through, so authentication and traffic policy live in config rather than in each backend.
 
 ## Prerequisites
 
@@ -153,5 +153,5 @@ $ curl -s -o /dev/null -w '%{http_code}\n' \
 
 - [docs/configuration.md](configuration.md) - the full configuration schema and every origin field.
 - [docs/policy.md](policy.md) - the policy engine, including rate limiting and IP filtering.
-- [docs/headers-reference.md](headers-reference.md) - the headers SBproxy reads and writes, including the forwarding headers added by default.
+- [docs/headers-reference.md](headers-reference.md) - the headers sbproxy reads and writes, including the forwarding headers added by default.
 - [docs/routing-strategies.md](routing-strategies.md) - host- and path-based routing across multiple backends.

@@ -1,8 +1,8 @@
-# SBproxy Configuration Reference
+# sbproxy Configuration Reference
 
 *Last modified: 2026-09-05*
 
-The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
+The complete configuration reference for sbproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
 For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, Lua, JavaScript, and WASM scripting, see [scripting.md](scripting.md). For the event system, see [events.md](events.md).
 
@@ -65,7 +65,7 @@ For AI-specific features in depth, see [ai-gateway.md](ai-gateway.md). For CEL, 
 
 ## Overview
 
-SBproxy reads its configuration from a YAML file, typically named `sb.yml`. This file defines how the proxy listens for traffic, which hostnames it handles, and what it does with each request.
+sbproxy reads its configuration from a YAML file, typically named `sb.yml`. This file defines how the proxy listens for traffic, which hostnames it handles, and what it does with each request.
 
 Load a config file. The path must be supplied explicitly; the binary does not auto-discover `sb.yml` in the current directory.
 
@@ -136,7 +136,7 @@ origins:
 
 ## JSON Schema (editor autocomplete + validation)
 
-SBproxy ships a generated JSON Schema at `schemas/sb-config.schema.json`.
+sbproxy ships a generated JSON Schema at `schemas/sb-config.schema.json`.
 Editor tooling that understands the `yaml-language-server` directive (VS Code
 with the YAML extension, IntelliJ / JetBrains, Helix) uses it for autocomplete,
 typed fields, and closed-enum hints.
@@ -869,7 +869,7 @@ proxy:
 Canonical mTLS supports built-in enrollment or operator-managed PKI. Enrollment
 startup verifies `state_dir/identity.json` with
 `state_dir/authority-verifying.key`. Manual PKI omits both files and requires
-the leaf certificate to contain the node ID DNS SAN plus exactly one SBproxy
+the leaf certificate to contain the node ID DNS SAN plus exactly one sbproxy
 identity URI SAN with cluster ID, node ID, roles, labels, server name, and a
 positive identity epoch. Every claim must match config. Do not mix attestation
 modes within a cluster, and increment the manual identity epoch for certificate
@@ -967,7 +967,7 @@ proxy:
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch. False opens no store file and claims no admin routes. |
 | `store_path` | path | required | Embedded store holding the catalog cache and the registration queue. Created owner-only in the `open(2)` call. |
-| `feed_path` | path | unset | Signed catalog feed, a file you sync. SBproxy reads and verifies it and never dials for it. Absent means no refresh is possible and the refresh route says so. |
+| `feed_path` | path | unset | Signed catalog feed, a file you sync. sbproxy reads and verifies it and never dials for it. Absent means no refresh is possible and the refresh route says so. |
 | `key_directory_path` | path | unset | Signed key directory naming the feed signing keys. Required whenever `feed_path` is set. |
 | `bootstrap_keys` | map | `{}` | Public Ed25519 keys, keyed by key id, valued as base64 of the raw 32 bytes. Public material only, so it belongs in version control. An empty map trusts nothing and refuses every feed; there is no key compiled into the binary. |
 | `stale_grace_secs` | int | `0` | How far past its own `expires_at` a feed may still be applied. Zero honors the publisher's expiry exactly. Also sets the refresh interval, clamped to `[60s, 1h]`; zero falls back to 300 seconds. |
@@ -1311,7 +1311,7 @@ proxy:
 | `local_path` | string | platform selection | Absolute redb database path. It must be nonempty, at most 4096 bytes, and contain no control characters. |
 
 Configuration validation checks only the path string and performs no
-filesystem I/O. At runtime, an explicit path wins. Without one, SBproxy tries
+filesystem I/O. At runtime, an explicit path wins. Without one, sbproxy tries
 a writable `/var/lib/sbproxy/compression-state.redb`, then
 `$XDG_STATE_HOME/sbproxy/compression-state.redb`, then
 `$HOME/Library/Application Support/sbproxy/compression-state.redb` on macOS or
@@ -1845,7 +1845,7 @@ backend left for any driver name to select.
 
 ## Tenants
 
-SBproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream credential resolution (and, through it, the credential a governed request authenticates against) and observability walk origin → tenant → proxy, picking the most specific scope that declares a match. Policy and secret-backend configuration are **not** tenant-scoped: there is no `tenants[].policies:` block (policies stay at origin and proxy-wide scope), and every tenant resolves `vault://`/`secret://` references against the same `proxy.secrets.backends:`. A tenant entry carries exactly three fields: `id`, `credentials`, and `observability`.
+sbproxy is a multi-tenant gateway. A tenant scope groups an operator's tenant of record (a customer, a deployment slice, a regulatory boundary) so the same proxy binary can serve isolated configurations. Every origin resolves to exactly one tenant; downstream credential resolution (and, through it, the credential a governed request authenticates against) and observability walk origin → tenant → proxy, picking the most specific scope that declares a match. Policy and secret-backend configuration are **not** tenant-scoped: there is no `tenants[].policies:` block (policies stay at origin and proxy-wide scope), and every tenant resolves `vault://`/`secret://` references against the same `proxy.secrets.backends:`. A tenant entry carries exactly three fields: `id`, `credentials`, and `observability`.
 
 For single-tenant deployments the synthetic `__default__` tenant is used implicitly; no operator action is required and existing configs see no behavior change.
 
@@ -1890,7 +1890,7 @@ Each tenant can declare its own `credentials:` block alongside the proxy default
 
 ## Origins
 
-Each key under `origins` is a hostname. When a request arrives, SBproxy matches the `Host` header to an origin key and applies that origin's configuration. Every origin must have an `action` block.
+Each key under `origins` is a hostname. When a request arrives, sbproxy matches the `Host` header to an origin key and applies that origin's configuration. Every origin must have an `action` block.
 
 ```yaml
 origins:
@@ -2043,7 +2043,7 @@ dimension through `GET /api/usage/spend?...&group_by=property:<key>`.
 
 ### outbound_credential
 
-`outbound_credential` decides what credential SBproxy presents to the upstream, so the agent or client never holds a per-upstream secret. The `type` field picks one of three modes.
+`outbound_credential` decides what credential sbproxy presents to the upstream, so the agent or client never holds a per-upstream secret. The `type` field picks one of three modes.
 
 | `type` | What it does |
 |--------|--------------|
@@ -2099,7 +2099,7 @@ The `action` block defines what the proxy does with a matched request. The `type
 
 ### proxy
 
-Forward requests to an upstream URL. The most common action type, and the right choice when SBproxy sits in front of an existing backend.
+Forward requests to an upstream URL. The most common action type, and the right choice when sbproxy sits in front of an existing backend.
 
 ```yaml
 origins:
@@ -2527,9 +2527,9 @@ as configured and does nothing.
 | `credentials.source` | string | `default_chain` | One of `default_chain`, `static`, `assume_role`. |
 | `credentials.access_key_id` | string | unset | AWS access key ID. Required by `static`, refused by the other sources. |
 | `credentials.secret_access_key` | string | unset | AWS secret access key. Required by `static`, refused by the other sources. `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are dereferenced at config load; an unresolvable reference is a hard error. |
-| `credentials.session_token` | string | unset | Session token for an already-issued short-lived key pair. Read by `static` only. SBproxy cannot renew a token it was handed; use `assume_role` for credentials that expire. |
+| `credentials.session_token` | string | unset | Session token for an already-issued short-lived key pair. Read by `static` only. sbproxy cannot renew a token it was handed; use `assume_role` for credentials that expire. |
 | `credentials.role_arn` | string | unset | Role to assume. Required by `assume_role`, refused by the other sources. |
-| `credentials.external_id` | string | unset | External ID demanded by the role's trust policy. Read by `assume_role` only. Held as a credential and never formatted by SBproxy, but not covered by the admin-config redaction pass, so supply it as a reference rather than an inlined literal. |
+| `credentials.external_id` | string | unset | External ID demanded by the role's trust policy. Read by `assume_role` only. Held as a credential and never formatted by sbproxy, but not covered by the admin-config redaction pass, so supply it as a reference rather than an inlined literal. |
 | `credentials.session_name` | string | `sbproxy` | Role session name recorded in CloudTrail. Read by `assume_role` only. |
 | `credentials.session_duration_secs` | int | role default | Requested role session length. Read by `assume_role` only. |
 | `credentials.profile` | string | unset | Named profile in the shared AWS config files. Read by `default_chain` and by the base identity `assume_role` starts from. |
@@ -2710,7 +2710,7 @@ chunk also causes a safe skip.
 | `target.target_tokens` | int | token mode | Aggregate target-model budget across returned marked bodies, from 1 through 1,000,000. It must be at least the marked chunk count for that request to be eligible. |
 
 The route connects lazily and shares its client. Only marked
-`format="text"` bodies are sent. In ratio mode, SBproxy rechecks each returned
+`format="text"` bodies are sent. In ratio mode, sbproxy rechecks each returned
 chunk against the same percentage using the request model. In target-token
 mode, it allocates the budget across chunks and rechecks the combined output
 with that model. A token target smaller than the marked chunk count skips
@@ -2735,7 +2735,7 @@ unchanged. Omitting the field preserves the legacy compatibility behavior.
 Requests select `on`, `off`, or a declared profile in this order:
 `X-Compression` header, governed-key `compression_profile`, CEL
 `compression:<selector>`, then route default. A malformed or undeclared header
-returns `400`; SBproxy strips a valid header before upstream dispatch.
+returns `400`; sbproxy strips a valid header before upstream dispatch.
 Malformed or undeclared operator-managed key and CEL selectors safely disable
 compression and record `invalid_operator`. See
 [AI context compression](ai-context-compression.md#profiles-and-request-selection)
@@ -2771,7 +2771,7 @@ Local, Redis, or mesh backend under an opaque ID; raw session identifiers and
 raw turns are not stored in that record. Local survives restart at the same
 file path but does not share records with another process. There is no
 OmniRoute import path, migration format, or runtime dependency. Enabling this
-feature starts and maintains native SBproxy state only.
+feature starts and maintains native sbproxy state only.
 
 For compatibility, the older boolean remains accepted:
 
@@ -2930,7 +2930,7 @@ Classifier mode ships these closed class maps:
 - `content_safety`: `violence`, `self_harm`, `sexual`, `hate_speech`,
   `illegal`, `safe`
 
-The `classes` map may be omitted. SBproxy then uses the versioned,
+The `classes` map may be omitted. sbproxy then uses the versioned,
 precomputed centroids bundled with the binary. Entries supplied under
 `classes` add deployment-specific examples to the matching shipped class;
 they do not replace the default centroid. Unknown class names are rejected.
@@ -3354,7 +3354,7 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships fifteen built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `ext_authz`, `oauth_introspection`, `kya`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. sbproxy ships fifteen built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `ext_authz`, `oauth_introspection`, `kya`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
@@ -3795,7 +3795,7 @@ See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working confi
 
 ### forward_auth
 
-Delegate authentication to an external service. SBproxy sends a subrequest to the auth service and uses the response status to allow or deny the original request. The right choice when auth logic lives in its own service.
+Delegate authentication to an external service. sbproxy sends a subrequest to the auth service and uses the response status to allow or deny the original request. The right choice when auth logic lives in its own service.
 
 ```yaml
 origins:
@@ -4202,7 +4202,7 @@ The access log records the matched principal's source under the `principal_kind`
 
 Policies are evaluated before the action runs. They enforce rate limits, security rules, and access controls. The `policies` field is a sibling of `action` and is an array of policy objects.
 
-SBproxy ships thirty policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `agent_budget`, `geoip`, and `user_agent_parser`. This page documents the most common ones; the rest have their own pages.
+sbproxy ships thirty policy types: `rate_limiting`, `rate_limit_budget`, `ip_filter`, `expression`, `rego`, `waf`, `ddos`, `csrf`, `security_headers`, `request_limit`, `sri`, `assertion`, `request_validator`, `body_threat_protection`, `content_digest`, `concurrent_limit`, `ai_crawl_control`, `object_authz`, `exposed_credentials`, `page_shield`, `dlp`, `openapi_validation`, `prompt_injection_v2`, `http_framing`, `agent_class`, `a2a`, `semantic_constraint`, `agent_budget`, `geoip`, and `user_agent_parser`. This page documents the most common ones; the rest have their own pages.
 
 ### rate_limiting
 
@@ -4514,7 +4514,7 @@ Every hit also carries bounded detection spans: an entity type plus a byte offse
 
 ### prompt_injection_v2
 
-Successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. When `detector` is omitted, a complete verified local model pair selects `inprocess`; when both artifacts are absent, SBproxy logs the resolved paths once and selects `heuristic-v1`. Partial or invalid artifacts fail startup rather than silently downgrading.
+Successor to the legacy `injection` / `prompt_injection` guardrail names. The v2 policy splits detection from enforcement: a swappable detector returns a score in `[0.0, 1.0]` plus a categorical label, and the policy maps the score onto an action. When `detector` is omitted, a complete verified local model pair selects `inprocess`; when both artifacts are absent, sbproxy logs the resolved paths once and selects `heuristic-v1`. Partial or invalid artifacts fail startup rather than silently downgrading.
 
 ```yaml
 policies:
@@ -4870,7 +4870,7 @@ whether or not header injection is on. Runnable:
 
 Transforms modify the response body before it reaches the client. They are specified as a list under `transforms` and run in order. Reach for transforms when you need to reshape API responses for different consumers.
 
-SBproxy supports twenty-eight transform types: `json`, `json_projection`, `json_schema`, `ai_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `pdf_markdown`, `css`, `lua`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing. `pdf_markdown` needs the optional `transform-pdf` build; every other type is in the default binary.
+sbproxy supports twenty-eight transform types: `json`, `json_projection`, `json_schema`, `ai_schema`, `template`, `replace_strings`, `normalize`, `encoding`, `format_convert`, `payload_limit`, `discard`, `sse_chunking`, `html`, `optimize_html`, `html_to_markdown`, `markdown`, `pdf_markdown`, `css`, `lua`, `lua_json`, `javascript`, `js_json`, `wasm`, `boilerplate`, `citation_block`, `json_envelope`, `cel`, `a2a_agent_card_rewrite`, plus a `noop` for testing. `pdf_markdown` needs the optional `transform-pdf` build; every other type is in the default binary.
 
 ### json
 
@@ -5328,7 +5328,7 @@ becomes one entry per credential, so the hit rate falls toward the per-caller
 repeat rate and the upstream sees more traffic. On an origin whose callers carry
 any cookie at all, the same applies per cookie, including a cookie no upstream
 reads. If that is your origin and the content really is identical for everyone,
-the answer is a `request_modifier` upstream of SBproxy that strips the cookie,
+the answer is a `request_modifier` upstream of sbproxy that strips the cookie,
 or leaving `response_cache` off for that origin and caching at a layer that
 knows the content is public.
 
@@ -5366,14 +5366,14 @@ Two more dimensions are stamped the same way and for the same reason:
 - **Tenant.** One hostname resolves to one origin and one tenant today, so the
   hostname already separated them. The tenant field says so directly, rather
   than leaving cross-tenant isolation as a property of the routing table.
-- **The negotiated content coding.** SBproxy forwards `Accept-Encoding`, so an
+- **The negotiated content coding.** sbproxy forwards `Accept-Encoding`, so an
   upstream that compresses returns different bytes to different callers. The
   key varies on the set of codings the caller accepts, not on the spelling, so
   `gzip, deflate, br` and `br;q=1.0, deflate, gzip;q=0.8` still share an entry.
 
 **A response that varies on something the key does not carry is not stored.**
 The upstream's `Vary:` header names the request headers that change its
-answer. SBproxy reads it at store time and refuses the entry when it names a
+answer. sbproxy reads it at store time and refuses the entry when it names a
 dimension the key does not have, because the alternative is a later request
 reading a variant it should have missed. `Accept-Encoding`, `Authorization`,
 `Proxy-Authorization`, `Cookie`, and `Host` are covered by the proxy itself;
@@ -6944,7 +6944,7 @@ action:
 
 ([config](../examples/trusted-proxies/))
 
-When SBproxy is itself behind another load balancer or CDN (Cloudflare, AWS ALB, Fly.io, internal LB), the immediate TCP peer is that LB, not the real client. To recover the real client identity safely, configure `proxy.trusted_proxies` with the source ranges of those upstream hops:
+When sbproxy is itself behind another load balancer or CDN (Cloudflare, AWS ALB, Fly.io, internal LB), the immediate TCP peer is that LB, not the real client. To recover the real client identity safely, configure `proxy.trusted_proxies` with the source ranges of those upstream hops:
 
 ```yaml
 proxy:
@@ -7428,7 +7428,7 @@ authentication:
 
 #### Backward compatibility
 
-Existing `${ENV}` and `file:/path/to/secret` shapes keep working unchanged. The Go-era `secret:<name>` colon form is removed and fails config load with a pointer at the `secret://<backend>/<name>` replacement. Legacy umbrella references shaped as `vault://<alias>/...` are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced.
+Existing `${ENV}` and `file:/path/to/secret` shapes keep working unchanged. The Go-era `secret:<name>` colon form is removed and fails config load with a pointer at the `secret://<backend>/<name>` replacement. Legacy umbrella references shaped as `vault://<alias>/...` are still accepted with a warning as of sbproxy 1.5.0; a removal release has not been announced.
 
 Rewrite known legacy aliases with:
 
@@ -7807,7 +7807,7 @@ executor instead of being substituted at load.
 
 ## ACME / auto TLS
 
-SBproxy can automatically provision and renew TLS certificates using the ACME protocol (Let's Encrypt or any ACME-compatible CA). One node or a fleet, the proxy answers the `http-01` challenge on its own listener, obtains the certificate, and renews it before expiry.
+sbproxy can automatically provision and renew TLS certificates using the ACME protocol (Let's Encrypt or any ACME-compatible CA). One node or a fleet, the proxy answers the `http-01` challenge on its own listener, obtains the certificate, and renews it before expiry.
 
 Two limits worth knowing before you build on it. `http-01` is the only challenge type the proxy drives, so wildcard names are out: Let's Encrypt issues those only over DNS-01. And a fleet needs a shared certificate store, for issuance and for answering the challenge; [HTTP-01 behind a load balancer](#http-01-behind-a-load-balancer) below is that mechanism in full.
 
@@ -7896,7 +7896,7 @@ proxy:
 
 ## Redis integration
 
-Redis has two roles in SBproxy: distributed caching and shared state through the
+Redis has two roles in sbproxy: distributed caching and shared state through the
 general L2 store, plus real-time messaging for config sync and cache
 invalidation. Both blocks are nested under `proxy`, but they use separate
 connection implementations. The verified TLS, authentication, database, and
@@ -8005,7 +8005,7 @@ Transport trust: HTTPS plus whatever the git host authenticated the fetch as. Th
 
 Two settings close most of that gap, and both are yours to choose:
 
-- **Pin `revision` to a full commit sha.** After fetching, SBproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
+- **Pin `revision` to a full commit sha.** After fetching, sbproxy resolves `HEAD` and refuses the document when it is not the commit you named. A branch moving underneath a pinned node cannot be followed silently, and a pinned node never reloads on someone else's push.
 - **Set `verify_signature: true`.** The resolved tag is checked first, then the commit, and a missing or unverifiable signature refuses the document. The signing key has to be in the git trust store on the proxy host.
 - **Set `confine: true`** when the repository is written by somebody other than whoever runs the proxy. The fetched document then loses the two powers a document authored elsewhere was never granted: a secret reference that reads this host directly (`env:NAME`, `file:PATH`, `vault://env/NAME`) and a config key that names a path on this host for the proxy to open. `${VAR}` still resolves, because that is how one shared document names per-node values.
 
@@ -8364,7 +8364,7 @@ Codes are `invalid_payload`, `denied_path`, `confinement_refused`, `compile_fail
 
 ### The wire contract
 
-Documented so a non-SBproxy server can serve subscribers. One endpoint, one method.
+Documented so a non-sbproxy server can serve subscribers. One endpoint, one method.
 
 **Request.**
 
@@ -8376,7 +8376,7 @@ X-Sbproxy-Subscriber-Id: edge-01
 If-None-Match: "7-sha256:2c26b46b68ffc68ff99b453c1d3041341340d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
 ```
 
-`Authorization` is the credential and the identity. `X-Sbproxy-Subscriber-Id` is a claim about it: SBproxy refuses a fetch whose header disagrees with the credential's registered subscriber (`403`), because the last-seen revision the endpoint records is the fleet's rollout evidence and attributing it to the wrong node makes that evidence worse than none. Sending no header at all is fine.
+`Authorization` is the credential and the identity. `X-Sbproxy-Subscriber-Id` is a claim about it: sbproxy refuses a fetch whose header disagrees with the credential's registered subscriber (`403`), because the last-seen revision the endpoint records is the fleet's rollout evidence and attributing it to the wrong node makes that evidence worse than none. Sending no header at all is fine.
 
 **Response.**
 

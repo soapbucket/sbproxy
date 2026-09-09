@@ -1,7 +1,7 @@
 # MCP gateway guardrails
 *Last modified: 2026-08-21*
 
-SBproxy's MCP gateway carries a small set of guardrail mechanisms for
+sbproxy's MCP gateway carries a small set of guardrail mechanisms for
 tool traffic: egress control, session risk accumulation, output
 quarantine, stdio supervision, run-as-user auth, and result
 compaction. They are implemented inside the sbproxy repository and are

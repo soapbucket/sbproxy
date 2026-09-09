@@ -1,7 +1,7 @@
 # Performance
 *Last modified: 2026-08-16*
 
-What SBproxy delivers on real hardware, with the methodology you'd need to reproduce it.
+What sbproxy delivers on real hardware, with the methodology you'd need to reproduce it.
 
 ## TL;DR
 
@@ -40,13 +40,13 @@ Matrix-v7 publishable run, c3-standard-8 GCE instances, LTO-enabled release buil
 
 ## How to read this
 
-**Latency, not just throughput.** SBproxy's design priority is tight tail latency. The p99 column is the one that matters in production. Most proxy-path scenarios land p99 under 1 ms; the cache and WAF scenarios land under 0.5 ms.
+**Latency, not just throughput.** sbproxy's design priority is tight tail latency. The p99 column is the one that matters in production. Most proxy-path scenarios land p99 under 1 ms; the cache and WAF scenarios land under 0.5 ms.
 
 **The full-chain number is the realistic one.** "Passthrough" is a useful ceiling, but real configs do work: parse a JWT, check a rate limiter, run a transform, look at the cache, then call upstream. Full-chain at 50k rps with 0.6 ms p99 is what you should expect when you stack features.
 
 **The AI streaming row looks slow on purpose.** SSE streaming throughput is gated by the upstream model's token generation rate. The interesting numbers there are the per-chunk overhead and time-to-first-byte, not rps.
 
-**WAF "blocking" is fast because it short-circuits.** That 185k rps is requests SBproxy rejects before they ever touch upstream. It's a different number from "throughput when traffic is clean," but it's the right number when you're sizing for an attack.
+**WAF "blocking" is fast because it short-circuits.** That 185k rps is requests sbproxy rejects before they ever touch upstream. It's a different number from "throughput when traffic is clean," but it's the right number when you're sizing for an attack.
 
 ## Where these numbers are weak
 

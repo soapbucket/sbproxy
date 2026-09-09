@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-28*
 
-Every request SBproxy accepts runs through one pipeline, implemented as a
+Every request sbproxy accepts runs through one pipeline, implemented as a
 sequence of Pingora `ProxyHttp` callbacks: `request_filter`,
 `upstream_peer`, `upstream_request_filter`, `response_filter`,
 `response_body_filter`, and `logging`, in that order. A rejection at any
@@ -72,7 +72,7 @@ logging                                    <- metrics, access log, typed event b
 
 ## 1. Connection, trace context, and origin match (steps 1-4)
 
-A client connects and sends a request with a `Host` header. SBproxy
+A client connects and sends a request with a `Host` header. sbproxy
 extracts W3C/B3 trace context (see [observability.md](observability.md)
 for how that becomes a span), handles ACME HTTP-01 challenges and the
 built-in `/health` and `/metrics` short-circuits, then resolves the

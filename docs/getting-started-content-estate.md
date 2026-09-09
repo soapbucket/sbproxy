@@ -4,7 +4,7 @@
 
 ## What you will build
 
-You will put SBproxy in front of an HTML upstream and have it convert each page into clean Markdown before it reaches the client. Agents and LLM pipelines that prefer Markdown get a compact, portable body; the proxy also rewrites the `Content-Type` header so the response is delivered with the right MIME type. This is the foundation for an agent-aware content estate, and the same origin can later negotiate shape per request and price AI crawlers.
+You will put sbproxy in front of an HTML upstream and have it convert each page into clean Markdown before it reaches the client. Agents and LLM pipelines that prefer Markdown get a compact, portable body; the proxy also rewrites the `Content-Type` header so the response is delivered with the right MIME type. This is the foundation for an agent-aware content estate, and the same origin can later negotiate shape per request and price AI crawlers.
 
 ## Prerequisites
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-The `oidc` auth provider turns SBproxy into an OpenID Connect
+The `oidc` auth provider turns sbproxy into an OpenID Connect
 Relying Party. Unlike the `jwt` provider, which only validates a
 bearer JWT that the caller already holds, this provider drives
 the full authorization-code + PKCE login dance: it redirects an
@@ -13,7 +13,7 @@ the session expires.
 
 This is the "put SSO in front of an app that has none" use case
 that operators reach for with oauth2-proxy, Pomerium, or
-Cloudflare Access. SBproxy ships it as a configuration auth
+Cloudflare Access. sbproxy ships it as a configuration auth
 provider; no separate sidecar needed.
 
 ## Quick start
@@ -48,7 +48,7 @@ the curl invocations to walk through.
 ## Flow
 
 1. The browser requests a protected origin without a session cookie.
-2. SBproxy mints a transaction cookie (sealed PKCE verifier + state
+2. sbproxy mints a transaction cookie (sealed PKCE verifier + state
    + nonce, TTL `tx_ttl_secs`) and 302's the browser to
    `authorization_endpoint?response_type=code&client_id=...&redirect_uri=https%3A%2F%2Fapp.example.com%2Foidc%2Fcallback&scope=...&state=...&nonce=...&code_challenge=...&code_challenge_method=S256`.
 3. The IdP authenticates the user and 302's back to
@@ -98,7 +98,7 @@ against the session secret is closed.
 
 The runnable configuration is [`examples/oidc/`](../examples/oidc/). Its IdP
 endpoints point at `idp.example.com`, which does not exist, so the login
-cannot complete. Everything SBproxy itself does before and after the IdP is
+cannot complete. Everything sbproxy itself does before and after the IdP is
 still reachable, and that is the half worth checking. Start it:
 
 ```bash

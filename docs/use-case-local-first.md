@@ -8,7 +8,7 @@
 
 The recording above shows provider failover between two hosted providers, the closest recorded behavior to this story's local-to-cloud spill. The local-first recording is still to come.
 
-The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 70 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
+The card is racked, the driver loads, and most of your prompts would run fine on it. But traffic spikes past what one GPU can serve, a few requests genuinely need a frontier model, and finance keeps asking whether the hardware was worth it. sbproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that routes to 70 providers or runs the weights on your own GPUs. This page uses both halves at once, and the ledger that comes with them answers the finance question.
 
 ## What you will build
 
@@ -17,7 +17,7 @@ An OpenAI-compatible endpoint backed by a single provider array. Provider zero i
 ## Prerequisites
 
 - A Linux host with an NVIDIA GPU for the local lane. This story was written against an L4-class card. The released binary adapts at runtime: on a GPU-free host the same config validates and boots, but the `serve:` block starts no engine and every request spills to the cloud lane.
-- An inference engine, which SBproxy acquires on first use: a pinned `llama-server` prebuilt for GGUF weights, or vLLM run through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch. `sbproxy doctor` reports what it found and names every blocker.
+- An inference engine, which sbproxy acquires on first use: a pinned `llama-server` prebuilt for GGUF weights, or vLLM run through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch. `sbproxy doctor` reports what it found and names every blocker.
 - An OpenAI API key (`OPENAI_API_KEY`) for the spill lane.
 - `curl` for sending requests, `jq` for reading responses and the ledger.
 

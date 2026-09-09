@@ -1,9 +1,9 @@
 # Observability
 *Last modified: 2026-08-28*
 
-SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
+sbproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
-This is the umbrella page: the cross-cutting mechanics (sinks, redaction, sampling, correlation ids, spans, dashboards, alerts) live here, and three companion pages own the record shapes and compatibility promises this page only points at. [access-log.md](access-log.md) is the per-request access-log schema (opt-in, one JSON line per completed request). [audit-log.md](audit-log.md) is the admin-action and tamper-evident audit trail (four independently opt-in chained channels). [metrics-stability.md](metrics-stability.md) is the generated catalog of every metric SBproxy emits and what is promised about its name. Start here for how the pillars fit together; go to those three for the field-by-field reference.
+This is the umbrella page: the cross-cutting mechanics (sinks, redaction, sampling, correlation ids, spans, dashboards, alerts) live here, and three companion pages own the record shapes and compatibility promises this page only points at. [access-log.md](access-log.md) is the per-request access-log schema (opt-in, one JSON line per completed request). [audit-log.md](audit-log.md) is the admin-action and tamper-evident audit trail (four independently opt-in chained channels). [metrics-stability.md](metrics-stability.md) is the generated catalog of every metric sbproxy emits and what is promised about its name. Start here for how the pillars fit together; go to those three for the field-by-field reference.
 
 ## Three pillars
 
@@ -1019,7 +1019,7 @@ names as though the proxy emitted them, and it emitted none of them.
 <!-- Generated from crates/sbproxy-observe/src/span_registry.rs. Do not hand-edit this block; run
      cargo run -q -p sbproxy-observe --bin generate-span-vocabulary -->
 
-Span names follow one of two conventions. SBproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
+Span names follow one of two conventions. sbproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
 
 The `Emitted` column is the one to read first. `yes` means production code opens the span and a drift guard proves it, by resolving the emitter against the source tree and requiring a call site outside tests. `not yet` means the name is reserved and published here and nothing opens it, so a trace query filtered on that name returns nothing. Four pillar spans cover an ordinary proxied request: the inbound phase, one per authentication check, one per policy evaluation, and one per response-body transform. The reserved names that remain are the payment, ledger, and audit ones, plus the settlement rail's second verb.
 
@@ -1072,7 +1072,7 @@ it.
 The attribute set below is the naming contract for the pillar spans that have not
 landed yet, not a description of traffic you can go and query today. Span
 attributes include the
-OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the SBproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
+OTel semantic conventions (`http.request.method`, `http.response.status_code`, `server.address`) plus the sbproxy-specific set (`sbproxy.request_id`, `sbproxy.tenant_id`, `sbproxy.route`, `sbproxy.agent_id`, `sbproxy.agent_class`, `sbproxy.rail`, `sbproxy.shape`, `sbproxy.ledger.idempotency_key`).
 
 Per-request attributes such as `request_id` are span attributes only, never Prometheus labels; the Hard rule under the cardinality budget above is the long form. `agent_id` is the exception that proves the shape of that rule: it rides the span in full fidelity and it is also a Prometheus label, because the label carries only the sanitized, budgeted form.
 
@@ -1095,7 +1095,7 @@ The AI request span (`ai.request`) follows the OpenTelemetry GenAI semantic conv
 
 Token counting happens at the proxy (not trusted from the upstream's self-report), cost is derived from the catalog stamped in `sbproxy.ai.pricing_version`, and the exact span value is `sbproxy.ai.cost_usd_micros` in micro-USD (`1e-6` USD). The GenAI attribute set is pinned by a conformance test to OpenTelemetry GenAI semconv `1.36.0`, with OpenInference pinned to a source revision in `crates/sbproxy-ai/src/tracing_spans.rs`, so emitted spans cannot silently drift off-spec.
 
-To intentionally bump the AI span vocabulary, update the semconv constants and required field lists in `crates/sbproxy-ai/src/tracing_spans.rs`, update the span helpers for any renamed attributes, update this table, then run the span conformance test and the OTLP span-arrival e2e tests. Do not change these names just because the upstream experimental GenAI conventions moved; keep the existing emitted vocabulary until SBproxy explicitly ships an opt-in or migration.
+To intentionally bump the AI span vocabulary, update the semconv constants and required field lists in `crates/sbproxy-ai/src/tracing_spans.rs`, update the span helpers for any renamed attributes, update this table, then run the span conformance test and the OTLP span-arrival e2e tests. Do not change these names just because the upstream experimental GenAI conventions moved; keep the existing emitted vocabulary until sbproxy explicitly ships an opt-in or migration.
 
 Prompt and completion content capture is disabled unless the AI origin sets
 `trace_content: true`. When enabled, content is redacted with the secret
@@ -1111,7 +1111,7 @@ the message content.
 
 ### Run identity across a multi-agent run
 
-One user request handled by several agents produces one trace per hop. Without a shared key those hops are unrelated traces, and the spend, the latency, and the blast radius of the whole run are invisible. SBproxy emits the OpenInference run attributes so a backend can put them back together.
+One user request handled by several agents produces one trace per hop. Without a shared key those hops are unrelated traces, and the spend, the latency, and the blast radius of the whole run are invisible. sbproxy emits the OpenInference run attributes so a backend can put them back together.
 
 | Attribute | What it holds |
 |---|---|
@@ -1165,11 +1165,11 @@ bounded by the tool registry.
 
 OTLP is vendor-agnostic. Use an OpenTelemetry Collector as the default ingress when you want fan-out, retries, memory limits, or per-signal routing. Direct export works for any single backend, including API-key backends: the telemetry block exposes endpoint, transport, service name, resource attributes, sampling, metric-export toggles, and a `headers:` map applied to every OTLP export request (traces, metrics, and any OTLP log sink). Header values accept secret references (`${VAR}`, `file:`, `vault://`, `secret://`, ...); they resolve at boot and the proxy refuses to start when one cannot be resolved, so a raw reference never reaches the collector, and literal header values are masked in config printouts.
 
-The reference Compose stack under `examples/observability-stack/` is the verified local path. SBproxy sends OTLP gRPC to the Collector on host port `4327`; the Collector receives on container port `4317` and fans traces to Tempo, Phoenix, and Langfuse. It mirrors OTLP metrics to Prometheus with remote write and sends OTLP logs to Loki.
+The reference Compose stack under `examples/observability-stack/` is the verified local path. sbproxy sends OTLP gRPC to the Collector on host port `4327`; the Collector receives on container port `4317` and fans traces to Tempo, Phoenix, and Langfuse. It mirrors OTLP metrics to Prometheus with remote write and sends OTLP logs to Loki.
 
-| Backend | SBproxy endpoint | Collector exporter / backend endpoint | What renders |
+| Backend | sbproxy endpoint | Collector exporter / backend endpoint | What renders |
 |---|---|---|---|
-| Arize Phoenix | `http://otel-collector:4317` via the reference Collector, or direct `http://localhost:6006` with `transport: http` when no Phoenix auth header is required | `otlphttp/phoenix` with `endpoint: http://phoenix:6006` and `x-project-name: SBproxy LLM Traces` | LLM trace tree, provider, model, prompt, completion, token split, cost, latency, and status from `gen_ai.*`, OpenInference `llm.*`, `input.value`, and `output.value`. |
+| Arize Phoenix | `http://otel-collector:4317` via the reference Collector, or direct `http://localhost:6006` with `transport: http` when no Phoenix auth header is required | `otlphttp/phoenix` with `endpoint: http://phoenix:6006` and `x-project-name: sbproxy LLM Traces` | LLM trace tree, provider, model, prompt, completion, token split, cost, latency, and status from `gen_ai.*`, OpenInference `llm.*`, `input.value`, and `output.value`. |
 | Langfuse | `http://otel-collector:4317`; use the Collector for Cloud and authenticated self-hosted deployments | `otlphttp/langfuse` with `endpoint: http://langfuse-web:3000/api/public/otel`, Basic auth, and `x-langfuse-ingestion-version: 4` | LLM generation view with prompt, response, usage, cost, model, user/session metadata when supplied, and errors. Langfuse is HTTP OTLP only. |
 | Jaeger | `http://otel-collector:4317`, or a Jaeger collector with OTLP enabled on `4317` gRPC / `4318` HTTP `/v1/traces` | `otlp/jaeger` to `jaeger-collector:4317` | Generic distributed traces. AI fields appear as searchable span attributes, but Jaeger does not render a specialized LLM trajectory UI. |
 | Grafana Tempo | `http://otel-collector:4317` | `otlp/tempo` to `tempo:4317`; the reference stack wires this already | Generic traces in Grafana Explore and TraceQL. Use exemplars to jump from Prometheus outliers to traces. |
@@ -1204,9 +1204,9 @@ metrics, and an `otlp` log sink authenticate identically. Header
 changes require a restart; the export pipelines initialize once at
 boot.
 
-##### SBproxy to Collector
+##### sbproxy to Collector
 
-Use this when the Collector is on the same Docker network as SBproxy:
+Use this when the Collector is on the same Docker network as sbproxy:
 
 ```yaml
 proxy:
@@ -1224,7 +1224,7 @@ proxy:
       metrics_interval_secs: 30
 ```
 
-Use this when SBproxy runs on the host and the reference Compose stack is running:
+Use this when sbproxy runs on the host and the reference Compose stack is running:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
@@ -1243,7 +1243,7 @@ exporters:
   otlphttp/phoenix:
     endpoint: http://phoenix:6006
     headers:
-      x-project-name: "SBproxy LLM Traces"
+      x-project-name: "sbproxy LLM Traces"
   otlphttp/langfuse:
     endpoint: http://langfuse-web:3000/api/public/otel
     headers:
@@ -1343,8 +1343,8 @@ attributes:
   sbproxy.ai.cost_usd_micros = 14
   sbproxy.ai.pricing_version = 2026-06-01
   sbproxy.tenant_id = default
-  input.value = "Say hello from SBproxy observability."
-  output.value = "Hello from SBproxy observability."
+  input.value = "Say hello from sbproxy observability."
+  output.value = "Hello from sbproxy observability."
 events:
   gen_ai.user.message
   gen_ai.assistant.message
@@ -1536,10 +1536,10 @@ Then open:
 - Prometheus at http://localhost:9090
 - Loki ready endpoint at http://localhost:3100/ready
 - Tempo via Grafana (no first-class UI)
-- Phoenix at http://localhost:6006, project `SBproxy LLM Traces`
-- Langfuse at http://localhost:3001 (login `admin@sbproxy.local` / `sbproxy-local-admin`), project `SBproxy LLM Traces`
+- Phoenix at http://localhost:6006, project `sbproxy LLM Traces`
+- Langfuse at http://localhost:3001 (login `admin@sbproxy.local` / `sbproxy-local-admin`), project `sbproxy LLM Traces`
 
-Point SBproxy at the stack:
+Point sbproxy at the stack:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4327 \
@@ -1550,7 +1550,7 @@ The proxy exposes `/metrics` on its own listener (`proxy.http_bind_port`), so wi
 
 The OTLP endpoint targets the OTel Collector (host port 4327, mapped to the container's 4317). The collector fans traces to Tempo, Phoenix, and Langfuse, mirrors OTLP metrics to Prometheus, and sends OTLP logs to Loki. The dashboards from `deploy/dashboards/` are pre-provisioned in Grafana, so you see metrics, logs, and traces flow as soon as the proxy starts handling requests.
 
-For a full LLM-native smoke test, enable `trace_content: true` on the AI origin and send a chat-completions request through SBproxy. Phoenix and Langfuse render the same generation with prompt, response, provider, model, token split, USD cost, TTFT, latency, and status fields from the emitted `gen_ai.*` and OpenInference attributes/events.
+For a full LLM-native smoke test, enable `trace_content: true` on the AI origin and send a chat-completions request through sbproxy. Phoenix and Langfuse render the same generation with prompt, response, provider, model, token split, USD cost, TTFT, latency, and status fields from the emitted `gen_ai.*` and OpenInference attributes/events.
 
 `docker compose down -v` drops the named volumes for Prometheus, Grafana, Tempo, Loki, and Langfuse's Postgres, ClickHouse, MinIO, and Redis storage for a fresh start.
 
@@ -1577,7 +1577,7 @@ Prometheus-side alerting is independent of these channels: `dashboards/prometheu
 
 - [access-log.md](access-log.md) - the per-request access-log record shape, filters, sampling, and header capture.
 - [audit-log.md](audit-log.md) - admin-action audit envelope and the four tamper-evident, hash-chained audit trails.
-- [metrics-stability.md](metrics-stability.md) - every metric SBproxy emits, its support tier, and its compatibility promise.
+- [metrics-stability.md](metrics-stability.md) - every metric sbproxy emits, its support tier, and its compatibility promise.
 - [ai-crawl-control.md](ai-crawl-control.md) - per-agent observability for the Pay Per Crawl policy.
 - `deploy/dashboards/` - Grafana JSON for the Wave 1 panels.
 - `deploy/alerts/` - PromQL recording and alerting rules.

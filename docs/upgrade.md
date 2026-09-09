@@ -1,4 +1,4 @@
-# Upgrade SBproxy
+# Upgrade sbproxy
 
 *Last modified: 2026-09-05*
 

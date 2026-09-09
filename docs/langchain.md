@@ -1,12 +1,12 @@
-# LangChain with SBproxy
+# LangChain with sbproxy
 
 *Last modified: 2026-08-19*
 
-A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
+A LangChain application normally talks to providers directly: `langchain-openai` calls `api.openai.com`, and each tool server is a separate connection with its own credentials. Point both sides at an sbproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the LangChain side the change is a base URL on the model and one server entry for tools.
 
 ## Chat completions through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so `ChatOpenAI` from the `langchain-openai` package works unchanged: set `base_url` to the gateway and pass your virtual key as the `api_key`. Save this as `chat.py`:
+sbproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so `ChatOpenAI` from the `langchain-openai` package works unchanged: set `base_url` to the gateway and pass your virtual key as the `api_key`. Save this as `chat.py`:
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -203,7 +203,7 @@ Two caveats on the native path. Releases through v1.9.0 answered `/v1/messages` 
 
 ## MCP tools through the gateway
 
-SBproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
+sbproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
 
 A minimal `mcp` origin federating two upstream tool servers:
 

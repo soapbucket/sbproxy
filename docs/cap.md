@@ -1,7 +1,7 @@
 # CAP token verification
 *Last modified: 2026-08-27*
 
-CAP (Crawler Authorization Protocol) is a JWT-based capability-token format for agent and crawler traffic. An agent presents a token in `CAP-Token: <jwt>` or `Authorization: CAP <jwt>`, and the token itself carries what the bearer may do: which paths, at what request rate, up to how many bytes a day. SBproxy ships the verifier side, the latency-critical half that runs on every request; tokens are minted by whichever issuer your deployment trusts, and the config names that issuer's keys.
+CAP (Crawler Authorization Protocol) is a JWT-based capability-token format for agent and crawler traffic. An agent presents a token in `CAP-Token: <jwt>` or `Authorization: CAP <jwt>`, and the token itself carries what the bearer may do: which paths, at what request rate, up to how many bytes a day. sbproxy ships the verifier side, the latency-critical half that runs on every request; tokens are minted by whichever issuer your deployment trusts, and the config names that issuer's keys.
 
 This pairs naturally with the crawler-metering surfaces: [ai-crawl-control.md](ai-crawl-control.md) challenges unpaid crawlers, and a CAP token is how a paid or contracted one proves its grant. The verified subject also feeds [trust-tiers.md](trust-tiers.md) and access-log attribution.
 
@@ -48,7 +48,7 @@ A verified token puts a principal on the request: the subject becomes the rate-l
 ## Honest limits
 
 - **The daily byte budget is not a hard cutoff.** The token's `bytes` claim (max bytes per UTC day) is verified, surfaced on the principal, and attributable per token through the access log, but nothing in the current binary severs traffic when the budget is exhausted. Enforce it downstream off the attribution data, or treat it as a contractual term rather than a technical one.
-- **Issuance is out of scope.** SBproxy verifies; it does not mint tokens or run an issuer endpoint. The `jwks_static` shape exists precisely so a deployment can pre-issue tokens with its own tooling and hand the gateway only the public keys.
+- **Issuance is out of scope.** sbproxy verifies; it does not mint tokens or run an issuer endpoint. The `jwks_static` shape exists precisely so a deployment can pre-issue tokens with its own tooling and hand the gateway only the public keys.
 - **No licensing issuer, and no marketplace bridge.** There is no RSL Open Licensing Protocol issuer here (the four-step flow that mints Ed25519-signed license tokens for AI crawlers), and no bridge to IAB's Content Authorization Marketplace Protocol. The gateway ships the verifying and challenging halves of crawler licensing: it can refuse an unlicensed crawler ([ai-crawl-control.md](ai-crawl-control.md)), publish its terms ([rsl.md](rsl.md)), and verify a token somebody else minted. Minting and settling are the parts a licensing business runs, and they are not in this binary. If you see the issuer named anywhere as a thing to configure, that is a documentation bug rather than a hidden feature.
 
 ## See also

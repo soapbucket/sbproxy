@@ -1,4 +1,4 @@
-# How SBproxy compares
+# How sbproxy compares
 
 *Last modified: 2026-08-28*
 
@@ -6,7 +6,7 @@ This page used to be a long competitor matrix. Those tables duplicated [architec
 
 ## Where to go instead
 
-- What SBproxy *is*: [architecture.md](architecture.md), [api-gateway.md](api-gateway.md), [ai-gateway.md](ai-gateway.md), [mcp-and-agents.md](mcp-and-agents.md).
+- What sbproxy *is*: [architecture.md](architecture.md), [api-gateway.md](api-gateway.md), [ai-gateway.md](ai-gateway.md), [mcp-and-agents.md](mcp-and-agents.md).
 - Moving a LiteLLM proxy: [migration-litellm.md](migration-litellm.md).
 - The four walkthroughs: [all-traffic-gateway.md](all-traffic-gateway.md).
 
@@ -14,7 +14,7 @@ This page used to be a long competitor matrix. Those tables duplicated [architec
 
 These rows are load-bearing. `crates/sbproxy-observe/tests/comparison_claims.rs` and `crates/sbproxy-platform/tests/proxy_protocol_wiring.rs` fail the build if they disappear or get a naked "Yes" they have not earned.
 
-| Capability | SBproxy |
+| Capability | sbproxy |
 |---|---|
 | Clustering substrate (gossip mesh, no Postgres) | Yes |
 | Rate limiting | Built-in (node-local; cluster-wide needs a shared backend) |

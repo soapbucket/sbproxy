@@ -160,7 +160,7 @@ targets:
         - bob-style
 ```
 
-A missing key, a non-array value, or non-string elements are treated as an empty inventory. SBproxy does not discover adapter inventories from upstreams. Operators generate this metadata from their source of truth and apply updates through normal config hot reload.
+A missing key, a non-array value, or non-string elements are treated as an empty inventory. sbproxy does not discover adapter inventories from upstreams. Operators generate this metadata from their source of truth and apply updates through normal config hot reload.
 
 `fallback_below` in `strategy_config` sets the minimum number of eligible warm targets required before `lora-aware` commits to a selection. It defaults to `1`; a configured `0` is normalized to `1`. Among qualifying warm targets, the lowest active connection count wins. Ties select the earlier target in the priority-ordered eligible slice; equal-priority targets retain configuration order.
 

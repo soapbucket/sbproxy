@@ -2,7 +2,7 @@
 
 *Last modified: 2026-09-05*
 
-`proxy.payments` is how SBproxy charges for a request and proves it was
+`proxy.payments` is how sbproxy charges for a request and proves it was
 paid. It is Apache-2.0, it is off unless you configure it, and it holds
 one rule above everything else: a paid request reaches the origin only
 after a durable record says the payment settled.
@@ -1342,7 +1342,7 @@ The boundaries are as load-bearing as the features.
   before its worker drains leaves settlements no other node will
   reconcile. Run payments on one node until the store has a shared
   backend.
-- **No wallet.** SBproxy holds no keys that move value and custodies
+- **No wallet.** sbproxy holds no keys that move value and custodies
   nothing. It talks to a facilitator, to Stripe, or to your own Lightning
   node.
 - **No x402 status or reorg API.** The adapter constructs `/verify` and

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-07-16*
 
-SBproxy serves GPU models through digest-pinned engine containers, and vLLM and
+sbproxy serves GPU models through digest-pinned engine containers, and vLLM and
 SGLang are both first-class. This page is the head-to-head that decides which one
 the gateway reaches for by default and when to switch. It ran on one real NVIDIA
 L4, not a simulation, so the numbers are small in scale but honest.
@@ -22,7 +22,7 @@ context) SGLang held the load better, so it is a one-line opt-in for that shape.
 | SGLang | `lmsysorg/sglang@sha256:f3b48b0e...c6d43`, the shipped `DEFAULT_SGLANG_IMAGE` (v0.5.2); args `--mem-fraction-static 0.85 --context-length 8192` (RadixAttention prefix caching is on by default) |
 | Client | one async OpenAI streaming client, 24 concurrent, 96 requests per run, `temperature 0`, `stream: true` with usage accounting |
 
-Both engines ran from the exact images SBproxy provisions by default, so this
+Both engines ran from the exact images sbproxy provisions by default, so this
 measures what an operator gets rather than a hand-tuned build. Prefix caching was
 on for both.
 
@@ -84,7 +84,7 @@ Prefix-heavy traffic is where SGLang pulls ahead. On the workload that mimics an
 agent with a large fixed system prompt, it sustained the burst more completely: it
 finished all 96 requests to vLLM's 72 and moved more requests per second. That
 tracks with its design, since RadixAttention is built to share the KV cache across
-requests with a common prefix, which is exactly this shape. It is also SBproxy's
+requests with a common prefix, which is exactly this shape. It is also sbproxy's
 own sweet spot, because a gateway sitting in front of an agent fleet sees the same
 system prompt over and over.
 
@@ -105,7 +105,7 @@ The gateway already encodes this choice, so mostly you leave it alone. With
 `engine: auto` (or no engine set) the fit planner chooses vLLM for safetensors on
 a capable GPU and llama.cpp for GGUF, and `auto` never resolves to SGLang. That
 default is right for most estates: model and quant coverage is widest on vLLM,
-throughput is tied, and when a container runtime is present SBproxy provisions the
+throughput is tied, and when a container runtime is present sbproxy provisions the
 pinned vLLM image with no further config. The policy is in
 [model-host.md](model-host.md#managed-engines).
 

@@ -1,4 +1,4 @@
-# SBproxy tool versioning
+# sbproxy tool versioning
 
 *Last modified: 2026-08-19*
 

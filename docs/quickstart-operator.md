@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-This is a Kubernetes follow-on, not the first SBproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
+This is a Kubernetes follow-on, not the first sbproxy exercise. Complete [Getting started](getting-started.md) first so you have seen an origin and `sbproxy validate` work on one machine.
 
 [`examples/k8s-gateway/`](../examples/k8s-gateway/) pairs primarily with
 [kubernetes.md](kubernetes.md), but it is a runnable config with the same
@@ -52,7 +52,7 @@ To try the operator without a registry at all, `make k8s-operator-smoke` builds 
 
 ## Install the operator
 
-Run this from an SBproxy checkout. It installs the CRDs, operator Deployment, ServiceAccount, and namespaced RBAC, pointed at the image you just pushed:
+Run this from an sbproxy checkout. It installs the CRDs, operator Deployment, ServiceAccount, and namespaced RBAC, pointed at the image you just pushed:
 
 ```bash
 helm upgrade --install sbproxy ./deploy/helm/sbproxy \

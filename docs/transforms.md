@@ -4,7 +4,7 @@
 
 A transform edits a response body before it reaches the client. Reach for one when the shape an upstream returns is not the shape a caller needs: trimming fields from a JSON payload, converting HTML to Markdown for an LLM, capping a body size, or running a sandboxed script or WASM module over the bytes. Transforms never touch the request; for that, see the request modifier and forward-rule sections of [configuration.md](configuration.md).
 
-SBproxy ships 28 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
+sbproxy ships 28 transform types plus `noop`. This page is the map: what a transform is, where it runs, the fields every transform shares, and a minimal working config for each kind. Full field references for the JSON/HTML/text transforms live inline below; the scripting, WASM, and agent-content transforms link out to their dedicated guides rather than duplicating them here.
 
 ## Where a transform runs
 

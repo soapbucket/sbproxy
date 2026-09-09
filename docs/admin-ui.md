@@ -473,11 +473,11 @@ The Logs page is the first debug loop for a misbehaving proxy:
    `sbproxy_ai=debug`, which turns on AI-path detail while the rest
    of the process stays at `info`. It applies immediately via
    `PUT /admin/log-level` and confirms with a toast. Official release binaries
-   compile SBproxy's own `debug!` and `trace!` events out with a static maximum
+   compile sbproxy's own `debug!` and `trace!` events out with a static maximum
    of `info`; raising the filter cannot restore those events. It can still
    expose more detail from dependencies compiled without that ceiling. Use the
    structured request decision fields below, or reproduce with a development
-   build when SBproxy-internal debug events are required.
+   build when sbproxy-internal debug events are required.
 2. Turn on Live tail and reproduce the problem. New requests stream
    in as they complete, with the same properties and gateway decisions
    as snapshot rows. The active filter predicate is applied to both.

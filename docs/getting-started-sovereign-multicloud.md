@@ -4,7 +4,7 @@
 
 ## What you will build
 
-You will run SBproxy as a cluster-edge gateway that serves more than one
+You will run sbproxy as a cluster-edge gateway that serves more than one
 tenant. The gateway recovers the real client IP behind a Kubernetes Ingress,
 re-resolves backend Pod endpoints as they rotate, and assigns each origin to a
 declared tenant. Tenant-scoped credential records can override proxy defaults.

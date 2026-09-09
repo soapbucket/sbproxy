@@ -539,7 +539,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 With a working key that returns the provider's own chat completion, so the
-body comes from the model rather than from SBproxy. The part this page is
+body comes from the model rather than from sbproxy. The part this page is
 about is not visible in a successful response: it is what happens when the
 provider fails.
 

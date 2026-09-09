@@ -4,7 +4,7 @@
 
 ## What you will build
 
-A single OpenAI-compatible endpoint that sits in front of your model providers. Clients send normal chat completion requests to SBproxy, and the gateway routes them to Anthropic with OpenRouter as a fallback, blocks prompt injection and PII before any provider is contacted, and records a daily token budget. Your application talks to one stable URL while the gateway handles failover, content checks, and cost tracking behind it.
+A single OpenAI-compatible endpoint that sits in front of your model providers. Clients send normal chat completion requests to sbproxy, and the gateway routes them to Anthropic with OpenRouter as a fallback, blocks prompt injection and PII before any provider is contacted, and records a daily token budget. Your application talks to one stable URL while the gateway handles failover, content checks, and cost tracking behind it.
 
 ## Prerequisites
 

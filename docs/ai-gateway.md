@@ -1,4 +1,4 @@
-# SBproxy AI gateway guide
+# sbproxy AI gateway guide
 
 *Last modified: 2026-08-29*
 
@@ -6,7 +6,7 @@
 
 Three providers behind one wire format ([config](../examples/ai-gateway-quickstart/)).
 
-SBproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 70 native providers behind one OpenAI-compatible API. That count is worth unpacking: 63 of the 70 catalog entries speak the OpenAI wire format and pass through unchanged, 3 (Anthropic, Gemini, Bedrock) get in-tree request and response translation, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) are forwarded in their native shape with no translation. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
+sbproxy includes an AI gateway that sits between your application and LLM providers. You get one API endpoint with automatic failover, cost tracking, rate limits, and programmable routing across OpenAI, Anthropic, and other providers. The proxy ships with 70 native providers behind one OpenAI-compatible API. That count is worth unpacking: 63 of the 70 catalog entries speak the OpenAI wire format and pass through unchanged, 3 (Anthropic, Gemini, Bedrock) get in-tree request and response translation, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) are forwarded in their native shape with no translation. You bring your own provider keys and the model name passes straight through, so you reach 200+ models without waiting on us to add them.
 
 This guide owns the end-to-end picture: provider setup, wire compatibility, routing, streaming, budgets, caching, prompt controls, and per-request attribution. Coming from an agent framework? [langchain.md](langchain.md) is the shortest path: it points LangChain's model client and MCP tools at the gateway and runs a first request end to end. Seven features get a summary here and a full page of their own: the [guardrail mesh](ai-guardrail-mesh.md), [outcome-aware routing](ai-outcome-aware-routing.md), the [AI policy plane](ai-policy-cel.md), [budget soft-landing](ai-predictive-budget.md), the [verifiable usage ledger](ai-usage-ledger.md), [LLM-aware resilience](ai-llm-aware-resilience.md), and [AI context compression](ai-context-compression.md). For those seven, the linked page is canonical; it carries the semantics, tuning advice, and reference tables.
 
@@ -180,7 +180,7 @@ The ceiling bounds one attempt, not the request. With `max_retries: 3` a caller 
 The override does not reach the gateway's own routing work. Semantic-cache embeddings, semantic-route embeddings, and shadow copies keep the shared client and its configured budgets, because a caller's completion budget is not a budget for work the caller did not ask for. It does reach a `managed_model` this process serves locally, which is dialed over the same provider HTTP client once the engine is up. It does not reach a `managed_model` served by another node in a cluster: that dispatch goes over the model plane on its own deadlines.
 
 ### Native providers
-70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, SBproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.
+70 native providers ship in-tree. The split: 63 entries are OpenAI-format passthrough, 3 (Anthropic, Gemini, Bedrock) carry in-tree translators, and 4 custom-format entries (SageMaker, Oracle OCI, Watsonx, Writer) pass through untranslated, so clients must send those four their native body shape. You bring your own key per provider and the `model` field passes straight through, so the gateway reaches 200+ models (and any model a provider ships next) without enumerating them. Direct adapters include `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `cohere`, `mistral`, `groq`, `deepseek`, `together`, `fireworks`, `cerebras`, `sambanova`, `nvidia`, `vertex`, `databricks`, `huggingface`, `vllm`, and `openrouter`. For the AWS entries, sbproxy signs the request itself: add `aws_sigv4:` to a `bedrock` or `sagemaker` provider and the gateway computes the SigV4 `Authorization` header per request, with credentials from the standard AWS provider chain, a static key pair, or a renewed STS role session.
 
 Any model a listed provider serves works without extra config. For a self-hosted or proprietary endpoint, point `vllm` or any provider at it with a custom `base_url`. `openrouter` is available as one of the providers when you want many vendors behind a single key. See `providers.md` for the full per-provider table.
 
@@ -1458,7 +1458,7 @@ See [examples/ai-shadow](../examples/ai-shadow/sb.yml).
 
 ## Proxy-native AI patterns
 
-SBproxy is a proxy first, so AI traffic composes with everything else the proxy offers: CEL policies, forward rules, regex guardrails, request modifiers. Patterns that are awkward or impossible to express in a pure AI gateway library:
+sbproxy is a proxy first, so AI traffic composes with everything else the proxy offers: CEL policies, forward rules, regex guardrails, request modifiers. Patterns that are awkward or impossible to express in a pure AI gateway library:
 
 | Pattern | Mechanism | Example |
 |---------|-----------|---------|
@@ -1514,7 +1514,7 @@ Two gaps are still open and are not surfaced this way, because nothing is droppe
 
 For Gemini, chat completions are rewritten to `generateContent`: roles become Gemini `contents`, system messages become `systemInstruction`, sampling options move under `generationConfig`, and Gemini candidates plus `usageMetadata` are converted back into OpenAI choices and usage. Gemini embeddings translate OpenAI `/v1/embeddings` requests to Gemini embedding calls and normalize the response back to OpenAI embedding objects.
 
-For Bedrock, chat completions are rewritten to the model-agnostic Converse API. System messages become Bedrock `system` entries, user and assistant turns become `messages`, supported sampling and tool fields move into Bedrock's native request shape, and Converse responses are converted back to OpenAI choices and usage. Bedrock and SageMaker requests are signed by SBproxy at the transport boundary, after this translation runs, so the SigV4 payload hash covers the translated Converse body.
+For Bedrock, chat completions are rewritten to the model-agnostic Converse API. System messages become Bedrock `system` entries, user and assistant turns become `messages`, supported sampling and tool fields move into Bedrock's native request shape, and Converse responses are converted back to OpenAI choices and usage. Bedrock and SageMaker requests are signed by sbproxy at the transport boundary, after this translation runs, so the SigV4 payload hash covers the translated Converse body.
 
 For streaming responses, the relay parses native Anthropic, Gemini, and Bedrock frames into the internal hub stream, then re-emits the client-facing format selected by the inbound route. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats are not translated in-tree; send their native body shape or route through a custom/OpenRouter adapter.
 
@@ -2420,7 +2420,7 @@ The runnable [`examples/price-ceiling/`](../examples/price-ceiling/) config ship
 
 ### Model prices
 
-Cost tracking and cost-based routing need a per-model price. SBproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
+Cost tracking and cost-based routing need a per-model price. sbproxy ships a built-in catalog of current families (GPT-5 / 4.1 / 4o / o-series, Claude 4.x and 3.x, Gemini 2.x and 1.5); a model the catalog does not know is billed at a deliberately high $5 / $5 per million tokens so a budget cap fires early rather than late. You can supply prices two ways, both layered over the catalog.
 
 Inline prices, per model, in USD per million tokens:
 
@@ -3292,10 +3292,10 @@ reasoning policy, and every replay still passes current output guardrails.
 
 `N` has provider-specific wire semantics. Anthropic and Gemini use it as the
 native thinking-token budget when the mapped model accepts that value.
-Anthropic requires `budget_tokens` to remain below `max_tokens`, so SBproxy
+Anthropic requires `budget_tokens` to remain below `max_tokens`, so sbproxy
 keeps a separate visible-output allowance and raises `max_tokens` to cover the
 thinking budget plus that allowance. OpenAI exposes effort rather than a
-numeric reasoning-token budget. SBproxy therefore selects low effort and caps
+numeric reasoning-token budget. sbproxy therefore selects low effort and caps
 the available completion at `N`, using `max_completion_tokens` for Chat
 Completions or `max_output_tokens` for a direct Responses-shaped call. The
 fixed fallback also caps the available completion or output field at `N`.
@@ -3322,7 +3322,7 @@ message once:
 Use brief, compact draft reasoning with only essential intermediate steps, then give the answer.
 ```
 
-For a Responses-shaped call, SBproxy prepends the same fixed text to
+For a Responses-shaped call, sbproxy prepends the same fixed text to
 `instructions` instead. The fallback contains no request text. A budget
 fallback caps `max_output_tokens` for Responses. For other request shapes, it
 caps an existing `max_completion_tokens` or `max_tokens` at `N`; when neither
@@ -3333,7 +3333,7 @@ Tool and code safety takes priority. A non-empty top-level `tools` or legacy
 bypasses them. The detector recognizes fenced code, common source declarations,
 source syntax, common source-file paths such as `src/main.rs`, and explicit
 requests such as "debug this Rust function." It does not treat a prose mention
-of "code" or "function" as sufficient. SBproxy captures these eligibility
+of "code" or "function" as sufficient. sbproxy captures these eligibility
 facts before context compression, so a compression lever cannot erase the
 evidence and make the request eligible later.
 
@@ -3664,7 +3664,7 @@ The source prompt is capped at 1 MiB and the eval set at 16 MiB. Each model
 response is capped at 1 MiB. `--max-candidates` accepts from 1 through 64.
 `--max-requests` covers the baseline cases, one candidate-generation request,
 and candidate evaluations. For `C` cases, the minimum useful budget is
-`2 * C + 1`: one baseline, one candidate, and the generation call. SBproxy
+`2 * C + 1`: one baseline, one candidate, and the generation call. sbproxy
 sorts usable shorter candidates by token count, then evaluates only the number
 of complete `C`-request evaluations that fit. To evaluate up to `K` candidates,
 allow `C * (K + 1) + 1` requests. The command never crosses the cap. It fails
@@ -3673,7 +3673,7 @@ request fails.
 
 The source must be a static instruction without Minijinja markers. The
 optimizer response must be a JSON array of strings, with an optional JSON code
-fence. SBproxy discards blank, duplicate, unchanged, and non-shorter
+fence. sbproxy discards blank, duplicate, unchanged, and non-shorter
 candidates. It also discards candidates with common few-shot markers such as
 `Example:`, paired `Input:` and `Output:`, or paired `User:` and `Assistant:`.
 Minijinja markers such as `{{`, `{%`, and `{#` are also rejected. These checks
@@ -3681,7 +3681,7 @@ are conservative syntax guards, not a semantic proof that a candidate contains
 no demonstration. Optimize dynamic templates and few-shot prompts with a
 task-specific process that evaluates their rendered form.
 
-Among candidates that pass, SBproxy chooses the lowest target-model token
+Among candidates that pass, sbproxy chooses the lowest target-model token
 estimate. A token-count tie prefers the higher quality score, then lexical
 order for determinism. The JSON artifact includes the source SHA-256, metric,
 both scores, noise tolerance, token counts, and an Admin-ready
@@ -4279,7 +4279,7 @@ To help you get started with the AI gateway, we provide several runnable example
 | [`ai-bedrock-direct`](../examples/ai-bedrock-direct/) | Direct integration with AWS Bedrock. | Add a provider named `bedrock` (or set `provider_type: bedrock` on any name) with an `aws_sigv4:` block naming the region; the gateway signs each request itself and needs no `api_key`. | Exposes Bedrock via the standard OpenAI-compatible API. |
 | [`ai-gemini-direct`](../examples/ai-gemini-direct/) | Direct integration with Google Gemini. | Add a provider named `gemini` (or set `provider_type: gemini`) with a Gemini API key. | Seamless integration with Gemini models without client SDK changes. |
 | [`ai-model-group`](../examples/ai-model-group/) | Model pooling. | A `model_groups:` entry binds one public name to several members, each with its own provider, upstream model id, and weight; a same-model-name pool across providers' `models:` lists still works for the simpler case. | The group's own strategy load-balances across its members, and the member's model id is what reaches the wire. |
-| [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | SBproxy streams Server-Sent Events (SSE) securely back to the client. |
+| [`ai-streaming`](../examples/ai-streaming/) | Streaming LLM completions. | Send requests with `stream: true`. | sbproxy streams Server-Sent Events (SSE) securely back to the client. |
 | [`ai-routing-fallback`](../examples/ai-routing-fallback/) | High-availability failover. | Set `routing.strategy: fallback_chain` and give each provider a `priority`; there is no separate generic `fallbacks:` key. | Transport failures and retryable 5xx responses from the primary provider fail over to the next provider in priority order. |
 | [`typed-fallbacks`](../examples/typed-fallbacks/) | Typed fallback triggers. | Set `context_window_fallbacks:` and/or `content_policy_fallbacks:` as siblings of `routing:`, each naming providers. | An oversized prompt reroutes to a larger-window model before dispatch; a content-policy refusal reroutes to a more permissive provider; the admin request log names the trigger that fired. |
 | [`semantic-routing`](../examples/semantic-routing/) | Routing on what a request means. | Set `routing.strategy: semantic_route` with `routes:` (a deployment plus exemplar prompts each), a `min_similarity` floor, a `fallback`, and an embedding source. Runs keyless on loopback stand-ins. | A code-shaped request lands on the code pool and a chat-shaped one on the chat pool, both matched by embedding similarity rather than by wording; a below-floor score falls back and says so in `routing_detail`. |

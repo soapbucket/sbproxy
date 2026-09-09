@@ -1,12 +1,12 @@
-# Mastra with SBproxy
+# Mastra with sbproxy
 
 *Last modified: 2026-08-19*
 
-A Mastra agent normally reaches providers directly: the model comes from the AI SDK provider layer and calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the Mastra side the change is a base URL on the model and one server entry for tools.
+A Mastra agent normally reaches providers directly: the model comes from the AI SDK provider layer and calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an sbproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the Mastra side the change is a base URL on the model and one server entry for tools.
 
 ## Chat completions through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and a Mastra `Agent` takes its model straight from the AI SDK provider layer, so `createOpenAI` from `@ai-sdk/openai` works unchanged. Set `baseURL` to the gateway, pass your virtual key as the `apiKey`, and take the model from `.chat()`:
+sbproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and a Mastra `Agent` takes its model straight from the AI SDK provider layer, so `createOpenAI` from `@ai-sdk/openai` works unchanged. Set `baseURL` to the gateway, pass your virtual key as the `apiKey`, and take the model from `.chat()`:
 
 ```typescript
 // Validated with @mastra/core@1.50.1, @ai-sdk/openai@4.0.10, zod@3.25.76.
@@ -29,7 +29,7 @@ const result = await agent.generate("In one sentence, what does an AI gateway do
 console.log(result.text);
 ```
 
-Save it as `agent.mjs` and run `node agent.mjs`. The `.chat()` call is deliberate: the bare form `openai("gpt-4o-mini")` builds a model for OpenAI's Responses API. The gateway serves `/v1/responses` for stateless requests, streaming included, but it refuses anything that leans on OpenAI-side state: `previous_response_id`, `conversation`, and `store: true` each return a 400 rather than silently running without the state they reference, and only `function` tools are forwarded (see the [Responses API boundaries](ai-gateway.md#responses-api-boundaries) in the AI gateway guide). `openai.chat("gpt-4o-mini")` speaks `/v1/chat/completions`, the wire format SBproxy translates for every provider it fronts, and avoids those boundaries entirely. If you prefer a provider with no OpenAI-specific behavior, `@ai-sdk/openai-compatible` (validated at 3.0.7) works the same way: `createOpenAICompatible({ name: "sbproxy", baseURL, apiKey }).chatModel("gpt-4o-mini")`.
+Save it as `agent.mjs` and run `node agent.mjs`. The `.chat()` call is deliberate: the bare form `openai("gpt-4o-mini")` builds a model for OpenAI's Responses API. The gateway serves `/v1/responses` for stateless requests, streaming included, but it refuses anything that leans on OpenAI-side state: `previous_response_id`, `conversation`, and `store: true` each return a 400 rather than silently running without the state they reference, and only `function` tools are forwarded (see the [Responses API boundaries](ai-gateway.md#responses-api-boundaries) in the AI gateway guide). `openai.chat("gpt-4o-mini")` speaks `/v1/chat/completions`, the wire format sbproxy translates for every provider it fronts, and avoids those boundaries entirely. If you prefer a provider with no OpenAI-specific behavior, `@ai-sdk/openai-compatible` (validated at 3.0.7) works the same way: `createOpenAICompatible({ name: "sbproxy", baseURL, apiKey }).chatModel("gpt-4o-mini")`.
 
 The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml` and start the gateway with `sbproxy sb.yml`:
 
@@ -127,7 +127,7 @@ The `agent.mjs` snippet above works against the same stack unchanged. `docker co
 
 ## MCP tools through the gateway
 
-SBproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
+sbproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
 
 A minimal `mcp` origin federating two upstream tool servers:
 

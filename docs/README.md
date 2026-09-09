@@ -1,8 +1,8 @@
-# SBproxy documentation
+# sbproxy documentation
 
 *Last modified: 2026-08-29*
 
-SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
+sbproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
 [overview.html](overview.html) is the one-page product overview: the five
 classes of AI traffic the proxy governs, the request path, and where we
@@ -11,11 +11,11 @@ with no dependencies.
 
 ## Which path is yours?
 
-- **New to SBproxy?** Start at [Start here](#start-here), then [Guides by use case](#guides-by-use-case).
+- **New to sbproxy?** Start at [Start here](#start-here), then [Guides by use case](#guides-by-use-case).
 - **Configuring something specific?** Jump straight to the category: [API gateway](#api-gateway-and-traffic-management), [AI gateway](#ai-gateway), [MCP and agents](#mcp-and-agents), [Payments](#payments-and-metering), [Policies](#policies), [Security](#security).
 - **Operating this in production?** [Observability and operations](#observability-and-operations), [Deployment](#deployment), [Migration and upgrading](#migration-and-upgrading).
 - **Building on top of an AI stack?** [AI gateway](#ai-gateway), [MCP and agents](#mcp-and-agents), [Connect clients](#connect-clients).
-- **Extending SBproxy?** [Scripting and extensibility](#scripting-and-extensibility), [Contribute](#contribute).
+- **Extending sbproxy?** [Scripting and extensibility](#scripting-and-extensibility), [Contribute](#contribute).
 - **Deciding whether to upgrade?** [Release notes](#release-notes) has what changed, grouped by the categories above.
 
 ## Start here
@@ -45,7 +45,7 @@ Then the maps:
 
 <a id="solve-a-problem"></a>
 
-- [getting-started-api-estate.md](getting-started-api-estate.md) - put SBproxy in front of an existing API.
+- [getting-started-api-estate.md](getting-started-api-estate.md) - put sbproxy in front of an existing API.
 - [getting-started-inbound.md](getting-started-inbound.md) - stitch of content-for-agents and agent identity (AI that calls you).
 - [getting-started-content-estate.md](getting-started-content-estate.md) - transform content for agents.
 - [getting-started-ai-estate.md](getting-started-ai-estate.md) - route requests to model providers.
@@ -64,7 +64,7 @@ Then the maps:
 
 ## API gateway and traffic management
 
-SBproxy's traditional reverse-proxy pillar: routing, load balancing, transforms, and the traffic-shaping layer underneath the AI and MCP features.
+sbproxy's traditional reverse-proxy pillar: routing, load balancing, transforms, and the traffic-shaping layer underneath the AI and MCP features.
 
 - [api-gateway.md](api-gateway.md) - the entry point for the traditional reverse-proxy pillar: routing, auth, rate limiting, WAF, load balancing, protocols, and OpenAPI, independent of any AI functionality. Start here if you're replacing Nginx, Envoy, or Kong.
 - [routing.md](routing.md) - the hub for how a request gets matched to an upstream: hostname matching, forward rules, load balancing algorithms, protocol-specific actions (GraphQL, gRPC, gRPC-Web, WebSocket), and failover.
@@ -95,7 +95,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [ai-predictive-budget.md](ai-predictive-budget.md) - predictive budgets with soft-landing: warn, then downgrade, then block as a scope approaches its cap.
 - [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md) - classify upstream failures (timeout, rate-limit, context-window, content-policy) and set per-error retry counts.
 - [ai-context-compression.md](ai-context-compression.md) - selectable compression profiles, explicit input budgets, Redis summary state, value accounting, evaluation, metrics, and logs.
-- [rag.md](rag.md) - SBproxy in front of a RAG pipeline: gateway-side retrieval from five vector stores, plus marked-context governance, guardrails, and metering.
+- [rag.md](rag.md) - sbproxy in front of a RAG pipeline: gateway-side retrieval from five vector stores, plus marked-context governance, guardrails, and metering.
 - [local-inference.md](local-inference.md) - run embeddings (semantic cache) and prompt-injection classify on local ONNX models via the sidecar or in-process.
 - [ai-lb-benchmark.md](ai-lb-benchmark.md) - P50/P95/P99/P99.9 latency comparison across AI router strategies under skewed load.
 - [providers.md](providers.md) - the catalog of supported LLM providers.
@@ -120,7 +120,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
 - [mcp-security-coverage.md](mcp-security-coverage.md) - see [Security](#security).
-- [admin-mcp.md](admin-mcp.md) - manage SBproxy from an MCP client: the gateway's own admin API as governed, read-only-by-default MCP tools for Claude Code or Cursor.
+- [admin-mcp.md](admin-mcp.md) - manage sbproxy from an MCP client: the gateway's own admin API as governed, read-only-by-default MCP tools for Claude Code or Cursor.
 - [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
 - [agent-orchestration.md](agent-orchestration.md) - governed agent discovery and bounded finite-state workflows through the live authenticated toolkit runtime; not the same A2A as the entry above.
@@ -136,7 +136,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [payment-settlement.md](payment-settlement.md) - `proxy.payments`: charge for a request and prove it was paid before the origin is called.
 - [payment-clustering.md](payment-clustering.md) - why a node running both `proxy.payments` and `proxy.cluster` refuses to start, and the staged path to a shared transactional store.
 - [402-challenge.md](402-challenge.md) - the exact bytes of every payment challenge, credential, problem document, and receipt.
-- [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape SBproxy would implement. None of it ships in the current binary.
+- [l402.md](l402.md) - L402 (Lightning HTTP 402) design notes: the protocol shape sbproxy would implement. None of it ships in the current binary.
 - [ai-crawl-control.md](ai-crawl-control.md) - the `ai_crawl_control` policy: Pay Per Crawl token challenge and ledger trait.
 - [comp-marketplace.md](comp-marketplace.md) - the `sbproxy-licensing` crate: IAB CoMP marketplace bridge (manifest, signed quote, redeem), bridging into the OSS OLP license-token wire format on redeem.
 - [ai-usage-ledger.md](ai-usage-ledger.md) - the verifiable usage ledger: hash-chained, Ed25519-signed spend receipts you can re-derive and verify.
@@ -146,7 +146,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 ## Scripting and extensibility
 
-- [plugins.md](plugins.md) - the entry point for extending SBproxy: the five config-level surfaces (CEL, Rego, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
+- [plugins.md](plugins.md) - the entry point for extending sbproxy: the five config-level surfaces (CEL, Rego, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
 - [scripting.md](scripting.md) - CEL, Rego, Lua, JavaScript, and WASM scripting reference, including the offline `sbproxy rego test` loop.
 - [opa-rego-policies.md](opa-rego-policies.md) - OPA-compatible policies (Rego): the Regorus interpreter in process, the input document, and when to choose Rego over CEL.
 - [extension-bundles.md](extension-bundles.md) - adding policies, transforms, actions, HTTP filters, and event hooks as loadable bundles, from a local directory or a verified git checkout, without linking a new proxy binary.
@@ -228,7 +228,7 @@ Point a framework you already run at the gateway: chat completions through the O
 
 - [migration-credentials.md](migration-credentials.md) - migrating the legacy `virtual_keys:` shape to the unified `credentials:` block.
 - [migration-mcp-rbac.md](migration-mcp-rbac.md) - upgrading MCP `ToolAccessPolicy` to the principal-aware ACL and the default-deny flip.
-- [migration-litellm.md](migration-litellm.md) - moving a LiteLLM proxy to SBproxy with `config import-litellm` and the field-by-field mapping.
+- [migration-litellm.md](migration-litellm.md) - moving a LiteLLM proxy to sbproxy with `config import-litellm` and the field-by-field mapping.
 - [comparison.md](comparison.md) - pinned capability rows (clustering, rate limiting, PROXY protocol). The long competitor matrix is retired; start from [architecture.md](architecture.md).
 
 ## Release notes

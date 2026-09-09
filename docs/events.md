@@ -1,8 +1,8 @@
-# SBproxy events
+# sbproxy events
 
 *Last modified: 2026-08-29*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, twenty pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+sbproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twenty-three), decision-audit records (`observability.log.decision_audit`, twenty pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -231,7 +231,7 @@ events:
     - policy_denied
 ```
 
-The file is created owner-only (`0600`), as is a directory SBproxy
+The file is created owner-only (`0600`), as is a directory sbproxy
 creates for it (`0700`). A decision event names the tenant, the rule,
 and what was refused, so the feed is a map of the policy surface. A
 file already on disk at a wider mode is tightened when the sink opens
@@ -301,7 +301,7 @@ events:
 
 ## Fail-closed semantics
 
-SBproxy names three request-time postures rather than a binary "fail open or closed," and the full matrix, with every subsystem that honors it, lives in [degradation.md](degradation.md). Summarized here because it decides what a missing or errored record means:
+sbproxy names three request-time postures rather than a binary "fail open or closed," and the full matrix, with every subsystem that honors it, lives in [degradation.md](degradation.md). Summarized here because it decides what a missing or errored record means:
 
 | Posture | The request | What is left behind |
 |---|---|---|
@@ -326,9 +326,9 @@ Standard resource attributes (`service.name`, `service.version`, `host.name`, `k
 
 ## Retention is the SIEM's job
 
-Nothing in SBproxy retains an event once it has been handed off. The `events:` queue is bounded and in-memory; a process restart discards whatever was still queued. The two chainable audit channels, `security_audit` and `config_audit` under `audit.sink: chain`, are durable and tamper-evident, but they are not a retention system either: there is no rotation or built-in expiry, each is one append-only file that grows for the life of the deployment, and the documented way to manage its size is to archive by copying, not by trimming a file whose whole value is that nothing in it can be quietly removed.
+Nothing in sbproxy retains an event once it has been handed off. The `events:` queue is bounded and in-memory; a process restart discards whatever was still queued. The two chainable audit channels, `security_audit` and `config_audit` under `audit.sink: chain`, are durable and tamper-evident, but they are not a retention system either: there is no rotation or built-in expiry, each is one append-only file that grows for the life of the deployment, and the documented way to manage its size is to archive by copying, not by trimming a file whose whole value is that nothing in it can be quietly removed.
 
-That is a deliberate division of labor, not a gap. A proxy that buffered, indexed, and aged out its own security event history would be reimplementing the thing you already run a SIEM for, badly, on the request path's memory budget. SBproxy's job is to produce the record, attribute it correctly, and get it off the box with the least possible cost to the request that triggered it. Your SIEM's job is everything after that: indexing, long-term storage, retention policy, and cross-tenant search. Point `events:` and `audit.sink: chain` at storage you control, and let that system own how long a record lives.
+That is a deliberate division of labor, not a gap. A proxy that buffered, indexed, and aged out its own security event history would be reimplementing the thing you already run a SIEM for, badly, on the request path's memory budget. sbproxy's job is to produce the record, attribute it correctly, and get it off the box with the least possible cost to the request that triggered it. Your SIEM's job is everything after that: indexing, long-term storage, retention policy, and cross-tenant search. Point `events:` and `audit.sink: chain` at storage you control, and let that system own how long a record lives.
 
 One thing this section is not claiming: apart from `mcp_governance_decision`, which carries `sbproxy.evidence.seq` and `sbproxy.evidence.instance` (see [Fail-closed delivery](#fail-closed-delivery) below), no event on the typed-event feed and nothing on decision-audit carries a sequence number a consumer could use to detect a gap. Both feeds are lossy under load by design (see Backpressure, below). If your compliance posture needs a provable, gapless record for an event type other than that one, it is not implemented here.
 
