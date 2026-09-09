@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-A category view of recent SBproxy changes, for readers who want to know
+A category view of recent sbproxy changes, for readers who want to know
 what changed in an area they care about rather than read a chronological
 diff. Covers versions 1.8.0 through 1.13.0.
 
@@ -243,7 +243,7 @@ in `CHANGELOG.md` before you upgrade anything flagged **Breaking**.
 - **`proxy.messenger_settings` names the deleted bus defects and must be removed.** (1.12.0) Config distribution is `proxy.config_authority`, and cache invalidation is `POST /admin/cache/purge`.
 - **A CEL syntax error is now a config error everywhere CEL comes from.** (1.9.0) A config with a CEL typo that used to boot fine will now refuse to start; run `sbproxy validate` against your config before upgrading.
 - **A reload that fails now really does change nothing.** (1.8.0)
-- **Changing `proxy.secrets` on a reload is now refused instead of silently ignored.** (1.8.0) The secret resolver holds live backend connections and is only ever built at startup, so a reload never actually picked up the change; it now fails outright with a message saying a restart is required. Rotating a secret's value inside your backend still needs no restart, only changing where SBproxy looks does.
+- **Changing `proxy.secrets` on a reload is now refused instead of silently ignored.** (1.8.0) The secret resolver holds live backend connections and is only ever built at startup, so a reload never actually picked up the change; it now fails outright with a message saying a restart is required. Rotating a secret's value inside your backend still needs no restart, only changing where sbproxy looks does.
 
 **Also shipped:**
 

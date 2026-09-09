@@ -551,7 +551,7 @@ curl -s -H 'Host: api.local' \
 }
 ```
 
-That is a standard JWKS-shaped document; the `x` field is the raw Ed25519 public key, base64url-encoded, and `kid` matches the key id on every receipt. From those two inputs you can check, with no SBproxy software and no trust in the operator:
+That is a standard JWKS-shaped document; the `x` field is the raw Ed25519 public key, base64url-encoded, and `kid` matches the key id on every receipt. From those two inputs you can check, with no sbproxy software and no trust in the operator:
 
 - Nothing was removed: sequence numbers run from 0 with no gaps.
 - Nothing was reordered or spliced in: each entry's `prev_hash` equals the previous entry's `entry_hash`.
@@ -560,7 +560,7 @@ That is a standard JWKS-shaped document; the `x` field is the raw Ed25519 public
 
 Be equally clear about what the chain does not prove. It proves the record is intact and attributable, not that the meter observed honestly in the first place: a `measured` unit is the proxy's own arithmetic over bytes it served you, a `route_weight` is checkable against the signed config revision on the receipt, but an `origin_header` unit is the upstream's claim, recorded verbatim, and the receipt proves only that the origin sent that value. The provenance is on every unit precisely so you can price your skepticism per source.
 
-The repository ships a reference implementation of the whole check, about 150 lines of Python with no SBproxy imports, at `examples/metering-verify/bin/verify-chain.py`:
+The repository ships a reference implementation of the whole check, about 150 lines of Python with no sbproxy imports, at `examples/metering-verify/bin/verify-chain.py`:
 
 ```bash
 curl -s -H 'Host: api.local' \
@@ -592,7 +592,7 @@ So a receipt that contradicts itself is refused rather than reported. Every path
 
 There is no posture that admits one. `failure_mode` answers what happens to traffic when the meter cannot write what it owes; by the time anything reads a receipt back, the request it describes is finished and the only decision left is whether to believe the document. Refusals are counted on `sbproxy_meter_incoherent_receipts_total`, labeled by tenant, and the label always reads `failure_mode="closed"`.
 
-As a buyer you can make the same check with no SBproxy software, and it is worth adding to whatever you already run: for each unit, `source: "measured"` must carry `bytes_in`, `bytes_out`, and `duration_ms`; `route_weight` must carry `config_revision`; `origin_header` must carry `header`. Anything else on a signed receipt is a claim the operator's own reader refuses, and you should refuse it too.
+As a buyer you can make the same check with no sbproxy software, and it is worth adding to whatever you already run: for each unit, `source: "measured"` must carry `bytes_in`, `bytes_out`, and `duration_ms`; `route_weight` must carry `config_revision`; `origin_header` must carry `header`. Anything else on a signed receipt is a claim the operator's own reader refuses, and you should refuse it too.
 
 ## Gap markers
 

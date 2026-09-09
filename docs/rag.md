@@ -2,11 +2,11 @@
 
 *Last modified: 2026-08-21*
 
-SBproxy supports retrieval-augmented generation on two surfaces, and they
+sbproxy supports retrieval-augmented generation on two surfaces, and they
 answer different questions.
 
 The first surface is gateway-performed retrieval: the gateway retrieves for
-you. A `rag:` block on an `ai_proxy` route makes SBproxy embed the incoming
+you. A `rag:` block on an `ai_proxy` route makes sbproxy embed the incoming
 question, run a tenant-scoped search against your vector store, and inject
 the results into the request before the model is called. The application
 sends a plain chat request and never touches an embedding API or a vector

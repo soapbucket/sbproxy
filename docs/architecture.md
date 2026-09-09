@@ -1,8 +1,8 @@
-# SBproxy architecture and deployment guide
+# sbproxy architecture and deployment guide
 
 *Last modified: 2026-09-08*
 
-This document covers the internal architecture of SBproxy, the request lifecycle, the plugin
+This document covers the internal architecture of sbproxy, the request lifecycle, the plugin
 system, the AI gateway, caching, events, and common deployment topologies.
 
 It is reference material rather than a walkthrough: it explains how the parts fit together and
@@ -17,7 +17,7 @@ methodology behind them.
 
 ## 1. Overview
 
-Public release archives contain a prebuilt SBproxy executable. Linux release artifacts
+Public release archives contain a prebuilt sbproxy executable. Linux release artifacts
 are linked against glibc. Running them does not require a Rust or C toolchain, a JVM, a
 Python interpreter, or a Node.js runtime. Source builds can target `musl` with
 `--target *-unknown-linux-musl` when a musl-linked executable is required.
@@ -26,7 +26,7 @@ The proxy is built on Cloudflare's [Pingora](https://github.com/cloudflare/pingo
 framework. Pingora supplies the tokio runtime, listener management, HTTP/1.1, HTTP/2
 (HTTP/3 is currently disabled pending native Pingora HTTP/3), TLS termination, and a
 phase-based callback model for the request
-pipeline. SBproxy layers its host router, compiled origin pipeline, plugin registry, and
+pipeline. sbproxy layers its host router, compiled origin pipeline, plugin registry, and
 hot-reload machinery on top of those primitives.
 
 The plugin system is modeled on Caddy's module pattern. Every extensible component type
@@ -170,7 +170,7 @@ sbproxy/
                               identity, SWIM liveness, typed state, caches,
                               metrics, managed models.
     sbproxy-capability/   - Executable capability registry: one vocabulary
-                              for what a build of SBproxy claims to support.
+                              for what a build of sbproxy claims to support.
     sbproxy-openapi/      - Emits an OpenAPI 3.0 document describing the
                               routes a compiled config exposes.
     sbproxy-observe/      - tracing-based structured logging,
@@ -798,7 +798,7 @@ and structured logging via `tracing`.
 
 ### Prometheus metrics
 
-SBproxy serves `/metrics` in Prometheus exposition format on the proxy listener itself,
+sbproxy serves `/metrics` in Prometheus exposition format on the proxy listener itself,
 and on the admin listener when the admin API is enabled; there is no separate
 `telemetry.bind_port` key or dedicated metrics server. Metric names share a single
 `sbproxy_*` namespace. Core HTTP counters include `sbproxy_requests_total` and
@@ -848,7 +848,7 @@ structured logs to the same collector. See [observability.md](observability.md).
  [ Upstream services / APIs ]
 ```
 
-One process, one config file. TLS handled by SBproxy via ACME (Let's Encrypt). Fine for
+One process, one config file. TLS handled by sbproxy via ACME (Let's Encrypt). Fine for
 internal tools, development environments, and low-traffic production services.
 
 ### Behind a load balancer (horizontal scaling)
@@ -986,7 +986,7 @@ The goal is near-zero heap allocations on the hot path for a proxy-type request:
 Pingora maintains a connection pool per upstream peer with tuned idle connection limits.
 HTTP/2 multiplexing is enabled for upstreams that negotiate it via ALPN. Connection reuse
 eliminates TCP and TLS setup cost for repeated requests to the same upstream. Pingora is
-production-tested at Cloudflare scale; SBproxy inherits its IO model directly.
+production-tested at Cloudflare scale; sbproxy inherits its IO model directly.
 
 ### DNS cache
 

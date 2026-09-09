@@ -7,7 +7,7 @@ Successor to the v1 `prompt_injection` heuristic guardrail. The v2
 policy splits *detection* from *enforcement*: a swappable detector
 returns a numeric score plus a categorical label, and the policy maps
 the score onto an action. The binary includes heuristic, in-process
-ONNX, and sidecar detectors. When `detector` is omitted, SBproxy uses a
+ONNX, and sidecar detectors. When `detector` is omitted, sbproxy uses a
 verified in-process model if a complete artifact pair is staged and
 otherwise logs one startup event and uses the heuristic. An explicit
 `detector: sidecar` is a composite: its primary gRPC detector requires
@@ -73,7 +73,7 @@ pre-loads state at startup, not in `detect` itself.
 
 ### In-process detection (the `inprocess` detector)
 
-For a single binary, run the ONNX classifier in the proxy. SBproxy
+For a single binary, run the ONNX classifier in the proxy. sbproxy
 checks regular-file/readability constraints, the model and tokenizer
 size budgets, mandatory SHA-256 pins, optional detached Ed25519
 signatures, and only then parses either artifact. No prompt-injection
@@ -105,7 +105,7 @@ policies:
 ```
 
 When `detector` is omitted, configured paths take precedence. If neither
-path is configured, SBproxy checks
+path is configured, sbproxy checks
 `<user-cache-dir>/sbproxy/models/prompt-injection-v2/model.onnx` and
 `tokenizer.json` (or `./.sbproxy-cache/models/...` when the OS has no
 user cache directory). Both files absent selects `heuristic-v1` and
@@ -207,7 +207,7 @@ classifier lands.
 
 ## In-process vs out-of-process model inference
 
-SBproxy ships two ways to run a learned classifier alongside the
+sbproxy ships two ways to run a learned classifier alongside the
 heuristic detector. `detector: sidecar` runs the primary model out of
 process behind a gRPC contract and requires a separately verified local
 ONNX fallback; faults in the richer primary runtime stay isolated while
@@ -221,7 +221,7 @@ The trained model weights do not ship at all. The registry intentionally
 has no trusted `prompt-injection-v2` entry: the audited first-party
 Apache-2.0 candidates exceeded the unchanged 200 MiB default limit,
 while smaller community exports lacked sufficient license or artifact
-provenance. Supply an immutable, reviewed pair and both digests; SBproxy
+provenance. Supply an immutable, reviewed pair and both digests; sbproxy
 will not download or trust a moving `resolve/main` URL automatically.
 
 The eval gate (precision and recall >= 0.7 against the bundled golden

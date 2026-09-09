@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-SBproxy serves an Agent Skills v0.2.0 discovery manifest at
+sbproxy serves an Agent Skills v0.2.0 discovery manifest at
 `/.well-known/agent-skills/index.json`. Cooperative agents fetch the
 manifest to discover the skills the origin advertises, then fetch each
 artifact at the URL the manifest pins. Every artifact body is
@@ -130,7 +130,7 @@ their existing audit pipeline.
 
 ## No script execution
 
-Per the v0.2.0 spec, SBproxy does not execute pre-/post-hooks or any
+Per the v0.2.0 spec, sbproxy does not execute pre-/post-hooks or any
 embedded scripts shipped inside an artifact. Artifacts are served as
 opaque bytes. Archives are validated for size and traversal safety at
 config-load time but are never extracted to disk during a request, and

@@ -1,7 +1,7 @@
 # Capacity planning
 *Last modified: 2026-08-16*
 
-How fast SBproxy runs is measured and published. How big a pod it needs is
+How fast sbproxy runs is measured and published. How big a pod it needs is
 not. This page says exactly which is which, gives you a starting point that
 states its own reasoning, and hands you the commands to replace that starting
 point with a number measured on your traffic.
@@ -41,8 +41,8 @@ scenario definitions, and the raw `oha` output for every replicate. None of it
 is vendored into this tree, so cloning this repo and running something will not
 regenerate the headline table.
 
-If you are evaluating SBproxy and want to check our arithmetic, clone that repo
-and run the matrix. If you only want to know what SBproxy does on your traffic,
+If you are evaluating sbproxy and want to check our arithmetic, clone that repo
+and run the matrix. If you only want to know what sbproxy does on your traffic,
 the local harness described below is more useful anyway, because our scenario
 files are not your workload.
 

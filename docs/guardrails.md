@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-21*
 
-External guardrails let an AI route ask a moderation or policy service before SBproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. SBproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
+External guardrails let an AI route ask a moderation or policy service before sbproxy sends a request upstream, after it receives a non-streaming response, or in logging-only mode. The adapter receives the selected model and the inspected phase. sbproxy records bounded labels for provider, phase, and outcome. It does not put prompt text, headers, or credentials into those labels.
 
 Built-in guardrails stay in `guardrails.input` and `guardrails.output`. They cover the local checks documented in [the AI gateway guide](ai-gateway.md). Structured-output enforcement is one of them: the built-in `schema` output guardrail validates the assistant payload against a compiled JSON Schema, documented in [the schema guardrail section](ai-gateway.md#schema-guardrail), not through an external adapter. External adapters live in `guardrails.external`, so a route can use both. Prompt Security and Model Armor are not named adapters. Use the generic webhook contract when a service has a compatible endpoint.
 
@@ -92,9 +92,9 @@ Watch the fixture log while both run. It prints `method`, `path`, `model`, `phas
 
 ## Streaming and multipart content
 
-An enforcing output adapter with `failure_posture: closed` rejects a request with `stream: true` before replay, cache lookup, or provider dispatch. SBproxy cannot inspect a stream before forwarding its bytes. Adapters with an admitting posture (`open` or `degraded`) and adapters in `logging_only` mode permit the stream and record that output content was unavailable.
+An enforcing output adapter with `failure_posture: closed` rejects a request with `stream: true` before replay, cache lookup, or provider dispatch. sbproxy cannot inspect a stream before forwarding its bytes. Adapters with an admitting posture (`open` or `degraded`) and adapters in `logging_only` mode permit the stream and record that output content was unavailable.
 
-Multipart request content is also unavailable to external input adapters. An enforcing, fail-closed input adapter rejects it before provider dispatch. Fail-open and logging-only adapters permit it and record the unavailable-content outcome. For a successful multipart response, SBproxy runs the output adapter when the media type is textual and the body is valid UTF-8. It applies the same unavailable-content policy to other response bodies before forwarding them.
+Multipart request content is also unavailable to external input adapters. An enforcing, fail-closed input adapter rejects it before provider dispatch. Fail-open and logging-only adapters permit it and record the unavailable-content outcome. For a successful multipart response, sbproxy runs the output adapter when the media type is textual and the body is valid UTF-8. It applies the same unavailable-content policy to other response bodies before forwarding them.
 
 ## Credentials and generic responses
 
@@ -106,7 +106,7 @@ The generic adapter sends this request body:
 {"input":"text selected by the pipeline","model":"selected-model","phase":"input"}
 ```
 
-The webhook must return JSON with `allowed` set to a boolean. `categories` may be an array of strings and `scores` may be a map of finite numbers. A provider-supplied `reason` is intentionally ignored. When a webhook blocks, SBproxy returns the normalized safe message `external guardrail blocked content` instead of forwarding provider text.
+The webhook must return JSON with `allowed` set to a boolean. `categories` may be an array of strings and `scores` may be a map of finite numbers. A provider-supplied `reason` is intentionally ignored. When a webhook blocks, sbproxy returns the normalized safe message `external guardrail blocked content` instead of forwarding provider text.
 
 ```json
 {"allowed":false,"categories":["prompt_injection"],"scores":{"prompt_injection":0.98}}
@@ -122,7 +122,7 @@ The schema describes every wire field, but a provider choice makes some fields r
 | `presidio` | `url` | `language` defaults to `en`. |
 | `lakera` | `api_key` | URL defaults to Lakera `/v2/guard`; `project_id` is optional. |
 | `aporia` | `api_key`, `project_id` | URL derives from the project when omitted. |
-| `azure_content_safety` | `url`, `api_key` | SBproxy adds `contentsafety/text:analyze` and API version `2024-09-01`; `severity_threshold` is 0 through 7 and defaults to 4. |
+| `azure_content_safety` | `url`, `api_key` | sbproxy adds `contentsafety/text:analyze` and API version `2024-09-01`; `severity_threshold` is 0 through 7 and defaults to 4. |
 | `bedrock` | `api_key`, `guardrail_id`, `guardrail_version`, plus `url` or `region` | Uses `Authorization: Bearer` for current Bedrock API keys. |
 | `crowd_strike` | `url`, `api_key` | `application_id` is optional. |
 | `mistral` | `api_key` | URL and model default to Mistral moderation; `score_threshold` is 0 through 1. |
@@ -133,9 +133,9 @@ Use the provider's own documentation for account setup and policy semantics: [La
 
 ## Bedrock guardrails inline on the Converse call
 
-The `bedrock` adapter in the table above is an out-of-band call: SBproxy makes its own `ApplyGuardrail` request to AWS, then decides whether to dispatch. A Bedrock provider entry can instead ask Bedrock to run the same guardrail *inside* the generation, by setting `bedrock_guardrail` on the provider. Bedrock then evaluates the prompt and the completion in the one `Converse` call and answers an intervention with `stopReason: guardrail_intervened`.
+The `bedrock` adapter in the table above is an out-of-band call: sbproxy makes its own `ApplyGuardrail` request to AWS, then decides whether to dispatch. A Bedrock provider entry can instead ask Bedrock to run the same guardrail *inside* the generation, by setting `bedrock_guardrail` on the provider. Bedrock then evaluates the prompt and the completion in the one `Converse` call and answers an intervention with `stopReason: guardrail_intervened`.
 
-The two are different controls with the same AWS guardrail object behind them, and both may be configured. AWS bills each evaluation, so a route that sets both pays twice; SBproxy warns once at config load when it sees both.
+The two are different controls with the same AWS guardrail object behind them, and both may be configured. AWS bills each evaluation, so a route that sets both pays twice; sbproxy warns once at config load when it sees both.
 
 | | `guardrails.external[]` with `provider: bedrock` | `providers[].bedrock_guardrail` |
 |---|---|---|
@@ -188,9 +188,9 @@ origins:
             trace: true
 ```
 
-`identifier` and `version` are required and are sent as `guardrailIdentifier` and `guardrailVersion`. `version: DRAFT` selects the working version. `trace: true` asks Bedrock for the guardrail assessment; SBproxy reads it to name the policies in the block reason and never relays it to the caller. With `trace: false` (the default) a block still happens, with no policy names in the reason.
+`identifier` and `version` are required and are sent as `guardrailIdentifier` and `guardrailVersion`. `version: DRAFT` selects the working version. `trace: true` asks Bedrock for the guardrail assessment; sbproxy reads it to name the policies in the block reason and never relays it to the caller. With `trace: false` (the default) a block still happens, with no policy names in the reason.
 
-SBproxy reads `stopReason: guardrail_intervened` off every Bedrock response, not only off routes that set this key, which is why the decision path above branches on the response rather than on the config. A guardrail attached to the model, the inference profile, or an agent in your AWS account produces the same stop reason, and relaying that to the caller as a successful empty completion was the bug. If you already run Bedrock, treat that as an upgrade-affecting change: see [config-stability.md](config-stability.md#a-bedrock-guardrail_intervened-response-is-now-a-403).
+sbproxy reads `stopReason: guardrail_intervened` off every Bedrock response, not only off routes that set this key, which is why the decision path above branches on the response rather than on the config. A guardrail attached to the model, the inference profile, or an agent in your AWS account produces the same stop reason, and relaying that to the caller as a successful empty completion was the bug. If you already run Bedrock, treat that as an upgrade-affecting change: see [config-stability.md](config-stability.md#a-bedrock-guardrail_intervened-response-is-now-a-403).
 
 There is no failure posture here, and that is not an omission. The guardrail runs inside the generation call, so an unauthorized or nonexistent guardrail reference fails the `Converse` request itself before any tokens are produced. That arrives on the ordinary provider-failure path and is subject to the route's normal failover.
 
@@ -229,7 +229,7 @@ The reason string names policy types and the topic and regex names from your own
 
 ### What this does not cover
 
-A streaming request (`stream: true`) still gets the guardrail: `guardrailConfig` is attached the same way, so Bedrock refuses upstream and the client sees `finish_reason: content_filter`. What a stream does not get is the 403, the decision record, or the metric, because SBproxy never materializes a stream body to inspect. Treat the finish reason as the signal there.
+A streaming request (`stream: true`) still gets the guardrail: `guardrailConfig` is attached the same way, so Bedrock refuses upstream and the client sees `finish_reason: content_filter`. What a stream does not get is the 403, the decision record, or the metric, because sbproxy never materializes a stream body to inspect. Treat the finish reason as the signal there.
 
 ## Troubleshooting
 

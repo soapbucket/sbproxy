@@ -4,7 +4,7 @@
 
 ![One guardrail mesh blocking an injection aimed at a local model and redacting PII bound for a hosted one](assets/use-case-guardrails-everywhere.gif)
 
-You put a gateway in front of the cloud providers, wrote guardrail rules, and told the auditors your AI traffic was governed. Then a developer stood up Ollama on a spare box under a desk, and every prompt sent there now skips injection screening, PII redaction, and the access log. SBproxy was built for exactly this split: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 70 providers or serves weights on your own GPUs, which means the desk box and the OpenAI account can live behind the same endpoint, subject to the same rules.
+You put a gateway in front of the cloud providers, wrote guardrail rules, and told the auditors your AI traffic was governed. Then a developer stood up Ollama on a spare box under a desk, and every prompt sent there now skips injection screening, PII redaction, and the access log. sbproxy was built for exactly this split: "Call any model. Serve your own. Govern both." One Apache-2.0 binary routes to 70 providers or serves weights on your own GPUs, which means the desk box and the OpenAI account can live behind the same endpoint, subject to the same rules.
 
 ## What you will build
 

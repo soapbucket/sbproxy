@@ -5,7 +5,7 @@
 ![Initialize an MCP session against the admin API and confirm the notification handshake](assets/admin-mcp.gif)
 
 If you are exposing tools to an agent, or you are the agent calling
-someone else's tools, this page is the map. SBproxy speaks two
+someone else's tools, this page is the map. sbproxy speaks two
 protocols for agent traffic: MCP (Model Context Protocol, for tool
 calling) and A2A (Agent-to-Agent, for agent-to-agent delegation). Both
 run through the same gateway as your HTTP and AI traffic, so the same

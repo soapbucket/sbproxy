@@ -27,7 +27,7 @@ about where each field originates.
 
 There are two sources, and they are not equally trustworthy.
 
-**A signed token. Preferred.** SBproxy reads the [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693#section-4.1)
+**A signed token. Preferred.** sbproxy reads the [RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693#section-4.1)
 `act` (actor) claim chain off the verified principal. Each delegation
 hop nests one `act` inside the last, so the chain is part of what the
 issuer signed. A caller cannot shorten it without invalidating the
@@ -56,7 +56,7 @@ So configure one of:
   claims, or
 - `proxy.trusted_proxies` covering the sidecar or mesh ingress that
   stamps the envelope, which must itself sit between the caller and
-  SBproxy.
+  sbproxy.
 
 If neither is configured the policy still runs, but it evaluates an
 empty envelope: depth 1, no chain, no caller identity. Nothing trips.
@@ -78,7 +78,7 @@ and only one of them is yours:
 | `MCP-Method: agents.invoke` | the caller | Anthropic A2A draft |
 | `route_glob` | the operator | Declares a path as A2A regardless of headers |
 
-The checks run in that order, and a signal SBproxy cannot interpret
+The checks run in that order, and a signal sbproxy cannot interpret
 never cancels the ones after it. An `A2A-Version` naming a major this
 build has not shipped means "do not decode this as 1.x", not "this is
 not A2A traffic": the content type, the MCP method, and above all your
@@ -162,7 +162,7 @@ exactly the shape a bypass hides in.
 
 ### Why the default is `open`
 
-SBproxy's rule is to fail closed for anything enforcing a security
+sbproxy's rule is to fail closed for anything enforcing a security
 boundary, and to fail open only where refusing would turn a
 non-security failure into an outage. This is the second case, and it is
 worth being precise about why.
@@ -317,7 +317,7 @@ origins:
             description: "Find a free table by time + party size"
 ```
 
-The action stores the card verbatim as JSON, and config compile validates it through the typed `AgentCard` parser in `sbproxy-modules`, so a card whose typed fields are the wrong shape (a `capabilities` list instead of an object, a non-string `url`, a card that is not a JSON object) is a boot error naming the card, not a runtime 500. The parser types only the fields SBproxy consumes (`capabilities`, `defaultInputModes`, `defaultOutputModes`, `name`, `description`, `version`, `url`, `skills`). Anything else the operator pastes (the A2A spec's optional `provider`, `authentication`, `supportsAuthenticatedExtendedCard`, etc.) lands on `extensions` and serializes back verbatim, so a full spec card still compiles and round-trips without loss.
+The action stores the card verbatim as JSON, and config compile validates it through the typed `AgentCard` parser in `sbproxy-modules`, so a card whose typed fields are the wrong shape (a `capabilities` list instead of an object, a non-string `url`, a card that is not a JSON object) is a boot error naming the card, not a runtime 500. The parser types only the fields sbproxy consumes (`capabilities`, `defaultInputModes`, `defaultOutputModes`, `name`, `description`, `version`, `url`, `skills`). Anything else the operator pastes (the A2A spec's optional `provider`, `authentication`, `supportsAuthenticatedExtendedCard`, etc.) lands on `extensions` and serializes back verbatim, so a full spec card still compiles and round-trips without loss.
 
 ## Serving the agent card
 
@@ -336,7 +336,7 @@ The same three paths are the rewrite transform's default `paths` list, so the se
 Two behavior notes:
 
 - **The served card advertises the proxy, never the upstream.** If the stored card carries `url`, `endpoint`, or a nested `agent.url`, the hostname on each is swapped at serve time using the same precedence the rewrite transform applies: a `proxy_host` configured on the origin's `a2a_agent_card_rewrite` transform wins, otherwise the inbound `Host` header. Path, query, and scheme are preserved. An operator can paste the upstream's own published card unedited and the gateway keeps discovery pointing at itself.
-- **The card is served before authentication and policies run**, like the neighboring discovery documents (`/.well-known/agents.json`, agent skills, ARDP). The public agent card is A2A's discovery entry point; A2A 1.0 keeps gated detail behind the separate authenticated-extended-card surface, which SBproxy does not emit. Do not put secrets in the card body. Non-`GET` methods on the discovery paths fall through to normal proxying.
+- **The card is served before authentication and policies run**, like the neighboring discovery documents (`/.well-known/agents.json`, agent skills, ARDP). The public agent card is A2A's discovery entry point; A2A 1.0 keeps gated detail behind the separate authenticated-extended-card surface, which sbproxy does not emit. Do not put secrets in the card body. Non-`GET` methods on the discovery paths fall through to normal proxying.
 
 ## Capability discovery (design)
 
@@ -344,7 +344,7 @@ The design also surfaces `capabilities.streaming` and `capabilities.pushNotifica
 
 ## Modality negotiation (library only)
 
-SBproxy ships pure-function helpers `AgentCard::negotiate_input` and `AgentCard::negotiate_output` that pair the caller's `Content-Type` and `Accept` against the agent's advertised `defaultInputModes` and `defaultOutputModes`. They are library code: nothing on the gateway's request path calls them yet, so the "effect" column below describes the intended wiring, not current behavior. Each call returns one of four typed outcomes:
+sbproxy ships pure-function helpers `AgentCard::negotiate_input` and `AgentCard::negotiate_output` that pair the caller's `Content-Type` and `Accept` against the agent's advertised `defaultInputModes` and `defaultOutputModes`. They are library code: nothing on the gateway's request path calls them yet, so the "effect" column below describes the intended wiring, not current behavior. Each call returns one of four typed outcomes:
 
 | Outcome | When | Intended effect on the upstream call |
 |---|---|---|

@@ -1,8 +1,8 @@
 # Security
 
-*Last modified: 2026-08-21*
+*Last modified: 2026-09-09*
 
-SBproxy sits between your clients and whatever they are calling, which makes it
+sbproxy sits between your clients and whatever they are calling, which makes it
 a good place to enforce things the service behind it might have forgotten. This
 page is the map: what the gateway is responsible for, what it is not, and where
 to read next.
@@ -43,7 +43,7 @@ processes beside a gateway that may hold cloud provider credentials, and the
 process, artifact, and cluster-identity boundaries around that are
 [security-model-host.md](security-model-host.md).
 
-Separately from all four: reporting a vulnerability in SBproxy, verifying a
+Separately from all four: reporting a vulnerability in sbproxy, verifying a
 release signature, and checking build provenance live in
 [`SECURITY.md`](../SECURITY.md) at the repository root.
 
@@ -66,7 +66,7 @@ reference grammar every secret-bearing config value resolves through,
 regardless of which field it sits in.
 
 **Constraining outbound credentials.** [outbound-dpop.md](outbound-dpop.md)
-covers RFC 9449 sender-constrained tokens on the credentials SBproxy presents
+covers RFC 9449 sender-constrained tokens on the credentials sbproxy presents
 to an upstream, so a stolen bearer token by itself is not enough to replay.
 
 ## What the gateway is actually good at
@@ -95,87 +95,57 @@ service called over a private link, an SSRF that stays inside one process:
 these are invisible here, and treating the gateway as coverage for them is the
 mistake worth avoiding.
 
-Detecting prompt injection reliably. SBproxy reports signals and constrains
+Detecting prompt injection reliably. sbproxy reports signals and constrains
 consequences. Neither is detection, and the docs say so wherever the distinction
 matters, because a control you believe in that does not work is worse than a
 gap you have written down.
 
 ## AI traffic, in brief
 
-The coverage page carries the row-by-row detail, including an honest mapping
-against the OWASP LLM Top 10 (2026 edition). The short version:
+[AI gateway security coverage](ai-gateway-security-coverage.md) carries the
+row-by-row detail, including the mapping against the OWASP LLM Top 10 (2026
+edition). This is the short version.
 
-Request and response bodies run through configured guardrails, and a verdict on
-a streamed response must equal the verdict the same bytes would get buffered
-whole; a streaming mode that cannot keep that promise is refused at config
-compile rather than approximated. A multipart Content-Type on a JSON-only AI
-surface, chat completions for example, is refused outright, so a caller cannot
-relabel a request past body inspection. [guardrails.md](guardrails.md),
-[ai-gateway.md](ai-gateway.md).
-
-The `pii:` block redacts AI request and response bodies. The `dlp` policy scans
-the request URI, headers, and by default the first 16 KiB of the buffered
-request body; it tags or blocks and never masks, and it never sees a response.
-They cover different surfaces and should not be confused. [prompt-injection-v2.md](prompt-injection-v2.md) states the
-detector's limits plainly: the default is a substring heuristic, and no
-detection model ships in the binary.
-
-Budgets deny at the cap across seven scopes, and denial of wallet is treated as
-enforcement rather than observation. Counters are per replica unless a shared
-store is configured, and when that store fails, enforcement degrades to
-per-instance tracking with a metric and a warning rather than silence.
-[ai-gateway.md](ai-gateway.md#budgets).
-
-Every outbound destination the gateway reaches, across every wired egress
-purpose and not just AI providers, is recorded with its authorization status,
-allowed, denied, or ungated, and is readable at `GET /api/egress`.
-
-Recording is not enforcement, and that is the distinction to get right before
-relying on any of this. A purpose stays `ungated` until you arm it: its
-sub-block under the top-level `egress:` section has to say
-`mode: deny_by_default` before anything is refused. Until it does, the dial
-still happens, still reaches the host, and still lands in the inventory, with
-nothing having been checked. A purpose reading `ungated` in `GET /api/egress`
-is one nothing is enforcing.
-
-An armed purpose is default-deny: only the hosts listed for it are reachable,
-and a host that resolves onto private address space is refused unless that
-sub-block allowed it. No purpose lets its HTTP client follow a `3xx` on its
-own; each `Location` is re-authorized from scratch against the same purpose,
-and a chain past ten hops is refused.
-
-Two paths go further and pin the dial: the MCP run-as-user token exchange and
-the `events:` webhook sink, the two whose request body is itself the
-credential. Pinned means the connection goes to the addresses the
-authorization resolved, not to a second lookup the HTTP client runs on its
-own, so a DNS answer that changes between the check and the connect cannot
-move the dial. On those two, a `3xx` `Location` is put back through the
-same scheme, host, port, DNS, and private-address checks the original
-destination passed, dialed on that hop's own pinned addresses, and bounded at
-ten hops inside one timeout for the whole chain rather than one per hop. A
-hop that changes scheme, host, or port loses `Authorization`,
-`Proxy-Authorization`, `Cookie`, and any request signature before it is
-replayed, and a request carrying a body does not make that hop at all: an
-OAuth subject token in a form field or a signed event batch is the
-credential, so there is nothing to strip that leaves a request the next hop
-could serve. A refusal names one of a closed set of reasons on the log line,
-on `sbproxy_egress_refused_total`, in `GET /api/egress`, and on the typed
-`egress_refused` event.
-
-Three other outbound paths, AI provider dispatch, the usage-sink webhook, and
-model-artifact downloads, re-authorize each redirect hop against the same
-allowlist but still let their HTTP client resolve the host again at dial
-time. They get the allowlist and the hop bound; they do not yet get the pin.
-
-Serving-path request budgets key by tenant, and a panicking tenant policy now
-denies that one request instead of crashing the process. Neither changes the
-recommendation in [multi-tenant.md](multi-tenant.md): mutually untrusting
-tenants get one process per trust boundary.
-
-Prompt-linked audit records carry salted digests and lengths, never content.
-Security, config, key-mutation, and admin-action records each append, when
-opted in per channel, to their own hash-chained, signed file that `sbproxy
-audit verify --channel` checks offline. [audit-log.md](audit-log.md).
+- **Guardrails.** Input and output run through configured guardrails, and a
+  streamed verdict must match what the same bytes would get buffered whole; a
+  mode that can't keep that promise is refused at config compile, not
+  approximated. A multipart body on a JSON-only surface such as chat
+  completions is refused outright, so a caller cannot relabel a request past
+  body inspection. [guardrails.md](guardrails.md), [ai-gateway.md](ai-gateway.md).
+- **Redaction.** `pii:` masks AI request and response bodies. `dlp` scans the
+  request URI, headers, and the first 16 KiB of the buffered request body by
+  default; it tags or blocks and never masks, and it never sees a response.
+  The two cover different surfaces and shouldn't be conflated.
+  [prompt-injection-v2.md](prompt-injection-v2.md) states the injection
+  detector's own limit: the default is a substring heuristic, and no
+  detection model ships in the binary.
+- **Budgets.** Deny at the cap across seven scopes; denial of wallet is
+  enforcement, not just logging. Counters are per replica unless a shared
+  store is configured, and if that store fails, enforcement degrades to
+  per-instance tracking with a metric and a warning rather than silence.
+  [ai-gateway.md](ai-gateway.md#budgets).
+- **Egress.** Every outbound destination is recorded at `GET /api/egress`,
+  allowed, denied, or ungated, across every wired purpose, not just AI
+  providers. Recording is not enforcement: a purpose stays `ungated`, and the
+  dial still happens, until its sub-block under the top-level `egress:`
+  section sets `mode: deny_by_default`. An armed purpose is default-deny,
+  refuses a host that resolves onto private address space, and re-authorizes
+  every redirect hop rather than trust the HTTP client's own follow. Two
+  paths pin the dial itself rather than just re-authorize it, because their
+  request body is the credential (the MCP run-as-user token exchange and the
+  `events:` webhook sink); three others get the allowlist and the hop bound
+  without the pin. See [AI gateway security coverage](ai-gateway-security-coverage.md#7-egress-is-inventoried)
+  and [threat-model.md](threat-model.md#current-wave-notes) for the
+  hop-by-hop mechanics.
+- **Tenancy.** Serving-path budgets key by tenant, and a panicking tenant
+  policy denies that one request instead of crashing the process. Neither
+  changes the recommendation in [multi-tenant.md](multi-tenant.md): mutually
+  untrusting tenants still get one process per trust boundary.
+- **Audit.** Prompt-linked audit records carry salted digests and lengths,
+  never content. Security, config, key-mutation, and admin-action records
+  each append, when opted in per channel, to their own hash-chained, signed
+  file that `sbproxy audit verify --channel` checks offline.
+  [audit-log.md](audit-log.md).
 
 ## Defaults worth knowing
 

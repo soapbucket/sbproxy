@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-16*
 
-SBproxy is north-south first: most operators run it as a
+sbproxy is north-south first: most operators run it as a
 top-of-rack gateway in front of an LLM provider or an internal
 API. This guide covers the second supported deployment shape, the
 **sidecar**, where one sbproxy container ships per workload pod
@@ -142,7 +142,7 @@ that the workload must be configured for it.
 
 ## Cold-start and footprint targets
 
-The sidecar pattern is sensitive to per-pod overhead. SBproxy's
+The sidecar pattern is sensitive to per-pod overhead. sbproxy's
 sidecar-tuned defaults aim for:
 
 | Metric | Target | How to verify |
@@ -208,7 +208,7 @@ The knobs, in order:
   `proxy` level: no Redis, no Postgres, no separate metrics
   listener. `/health` and `/metrics` are served on this same
   port.
-* Origin keys are exact hostnames; SBproxy refuses a bare `*`
+* Origin keys are exact hostnames; sbproxy refuses a bare `*`
   catch-all at config compile (a leading `*.` label such as
   `*.example.com` is supported, but not an unqualified wildcard).
   Add one origin block per destination host the workload calls, each

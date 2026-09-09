@@ -1,4 +1,4 @@
-# SBproxy Features Hub
+# sbproxy Features Hub
 
 *Last modified: 2026-08-28*
 

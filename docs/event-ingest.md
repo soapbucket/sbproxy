@@ -20,7 +20,7 @@ worth naming because it is the design being copied: a small default set,
 optional exporters that exist but do nothing until a pipeline names them,
 and configuring one is not the same as enabling it.
 
-What SBproxy does differently is refuse to pay for that split at build time.
+What sbproxy does differently is refuse to pay for that split at build time.
 There is no `nats` or `clickhouse` cargo feature. Both destinations are
 always compiled, so a release cannot ship a binary whose config schema
 advertises a sink it cannot construct, and `sbproxy validate` tells you
@@ -145,7 +145,7 @@ has heard of, and a `307` replays a body verbatim.
 
 ### The table
 
-SBproxy never applies DDL. Applying schema to somebody's warehouse from a
+sbproxy never applies DDL. Applying schema to somebody's warehouse from a
 proxy is a privilege nobody asked it to have, and an operator running
 ClickHouse already has a way to run DDL. Create the table first; the sink
 fails loudly against a missing one.

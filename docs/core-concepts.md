@@ -2,23 +2,23 @@
 
 *Last modified: 2026-07-28*
 
-SBproxy has one request pipeline. The client chooses a hostname, SBproxy finds that hostname in `origins:`, runs the configured policy and action, then returns the upstream response. The upstream can be an ordinary HTTP service, an MCP tool collection, or an AI provider. The request is still handled by the same gateway.
+sbproxy has one request pipeline. The client chooses a hostname, sbproxy finds that hostname in `origins:`, runs the configured policy and action, then returns the upstream response. The upstream can be an ordinary HTTP service, an MCP tool collection, or an AI provider. The request is still handled by the same gateway.
 
 ## The request pipeline
 
-1. A client connects to an SBproxy listener and sends a request with a `Host` header.
-2. SBproxy selects the matching origin in `origins:`.
+1. A client connects to an sbproxy listener and sends a request with a `Host` header.
+2. sbproxy selects the matching origin in `origins:`.
 3. The origin's authentication, policies, and transforms run around its action.
 4. The action proxies HTTP, dispatches an MCP method, or sends an AI request to a provider.
-5. SBproxy applies response work, records observability data, and sends the result to the client.
+5. sbproxy applies response work, records observability data, and sends the result to the client.
 
-An origin is the unit of configuration that owns this work. It has a client-facing hostname and an action. An action describes what happens after SBproxy accepts the request. A provider is an upstream AI service or local model endpoint used by an `ai_proxy` action.
+An origin is the unit of configuration that owns this work. It has a client-facing hostname and an action. An action describes what happens after sbproxy accepts the request. A provider is an upstream AI service or local model endpoint used by an `ai_proxy` action.
 
 The detailed order and extension points are in [architecture.md](architecture.md#3-request-pipeline). [configuration.md](configuration.md) is the field-by-field source of truth.
 
 ## APIs, MCP, and AI traffic
 
-| Traffic type | What the client sends | What SBproxy routes | Typical result |
+| Traffic type | What the client sends | What sbproxy routes | Typical result |
 |---|---|---|---|
 | HTTP API | An HTTP method, path, headers, and body | An HTTP request to an upstream service | The upstream HTTP response |
 | MCP | A JSON-RPC method such as `tools/list` or `tools/call` | A tool call to a configured MCP or OpenAPI-backed server | A JSON-RPC tool catalog or tool result |
@@ -38,6 +38,6 @@ The admin plane changes or inspects a running proxy. It includes authenticated c
 
 `sb.yml` is source input, not a set of instructions interpreted one line at a time for every request. At startup, `sbproxy validate` and `sbproxy serve -f` parse and compile it into an origin pipeline. Compilation catches schema and semantic errors before a listener starts.
 
-While SBproxy is running, the file watcher, `SIGHUP`, `sbproxy apply`, and authenticated `POST /admin/reload` use the same reload primitive. SBproxy compiles a candidate configuration first. If it succeeds, the new pipeline is swapped in and new requests use it. If it fails, the prior pipeline continues serving. Some process state, including rate-limit and budget accumulators, survives a compatible reload.
+While sbproxy is running, the file watcher, `SIGHUP`, `sbproxy apply`, and authenticated `POST /admin/reload` use the same reload primitive. sbproxy compiles a candidate configuration first. If it succeeds, the new pipeline is swapped in and new requests use it. If it fails, the prior pipeline continues serving. Some process state, including rate-limit and budget accumulators, survives a compatible reload.
 
 For the exact reload contract and its limits, see [the manual's hot-reload section](manual.md#9-hot-reload). For a production change preview, see [`sbproxy plan`](manual.md#plan---diff-a-proposed-config-against-a-baseline).

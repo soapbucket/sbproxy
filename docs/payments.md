@@ -3,7 +3,7 @@
 *Last modified: 2026-08-19*
 
 If you want to charge for access to an API, an AI endpoint, or your
-content, this page is the map across three separate things SBproxy
+content, this page is the map across three separate things sbproxy
 ships that are easy to conflate: getting paid before serving a
 request, proving how much was consumed after the fact, and pricing AI
 crawler traffic specifically. Each has its own page; this one says

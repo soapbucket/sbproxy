@@ -1,7 +1,7 @@
 # JSON Schema for `sb.yml`
 *Last modified: 2026-08-16*
 
-SBproxy publishes a generated JSON Schema for the typed `sb.yml` envelope.
+sbproxy publishes a generated JSON Schema for the typed `sb.yml` envelope.
 Editors that understand the schema (VS Code with the YAML extension, the
 IntelliJ / JetBrains family, Helix) can autocomplete known envelope fields,
 check their types, and offer closed-enum values.

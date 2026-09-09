@@ -2,13 +2,13 @@
 
 *Last modified: 2026-09-05*
 
-Use `cedar_policies` on an `mcp` action to allow, deny, or require operator approval for federated tool calls. SBproxy compiles the Cedar source when it loads the configuration and evaluates it after RBAC, argument policies, and quotas allow the call.
+Use `cedar_policies` on an `mcp` action to allow, deny, or require operator approval for federated tool calls. sbproxy compiles the Cedar source when it loads the configuration and evaluates it after RBAC, argument policies, and quotas allow the call.
 
 **Current limits:** the HTTP `tools/call` dispatcher supplies `Agent::"anonymous"` to Cedar, including for authenticated callers. Cedar receives an empty entity store and context. Use MCP RBAC for caller-specific access and CEL or Rego argument policies for argument-based checks. `type: local` tools bypass Cedar. These limits apply to the running gateway; offline replay lets you supply a principal UID yourself.
 
 ## Quickstart: allow, deny, and require confirmation
 
-This walkthrough uses the files in [examples/cedar-mcp-full](../examples/cedar-mcp-full/). Install SBproxy 1.14.0 and `jq`, then run the commands from the repository root. The example has no inbound authentication and is intended for local testing.
+This walkthrough uses the files in [examples/cedar-mcp-full](../examples/cedar-mcp-full/). Install sbproxy 1.14.0 and `jq`, then run the commands from the repository root. The example has no inbound authentication and is intended for local testing.
 
 Start the mock REST upstream in one terminal:
 
@@ -175,9 +175,9 @@ permit(
 
 Every other tool is denied by default. RBAC must still allow `search_repos` before Cedar can evaluate it.
 
-For a broad allow with exceptions, use the quickstart's catch-all `permit`, then add `forbid` rules for the resources to block. `@confirm` is an SBproxy annotation on a `forbid`; Cedar itself still evaluates that statement as a forbid.
+For a broad allow with exceptions, use the quickstart's catch-all `permit`, then add `forbid` rules for the resources to block. `@confirm` is an sbproxy annotation on a `forbid`; Cedar itself still evaluates that statement as a forbid.
 
-| Matching policies | SBproxy verdict |
+| Matching policies | sbproxy verdict |
 |---|---|
 | At least one permit, no matching forbid | Allow |
 | No matching permit and no matching forbid | Deny |
@@ -220,7 +220,7 @@ origins:
       # Keep the Cedar policies, RBAC, and federation from the example.
 ```
 
-`approval.store` names the persistent JSON approval file. Its path must be writable by SBproxy. The temporary path above is for the demo; choose a durable path for deployment. `hold_ttl` defaults to 15 minutes and controls how long an unanswered hold remains pending. Expiry drops the hold without authorizing the call.
+`approval.store` names the persistent JSON approval file. Its path must be writable by sbproxy. The temporary path above is for the demo; choose a durable path for deployment. `hold_ttl` defaults to 15 minutes and controls how long an unanswered hold remains pending. Expiry drops the hold without authorizing the call.
 
 Keep `approve_deploy` out of `approval.tools` for this walkthrough. That selector queues matching tools before Cedar runs; the store alone is enough to queue a Cedar Confirm verdict.
 
@@ -343,7 +343,7 @@ A Cedar-only edit has blast radius **Reload**, with a path under `action.cedar_p
 | Replay refuses multiple origins | Supply `--origin` with the same hostname present in the proposed and baseline YAML. |
 | Replay exits 0 despite unexpected denies | Add `expected` labels; without assertions or a baseline, successful evaluation alone is enough for exit 0. |
 
-Cedar policies are authored in YAML. The embedded policy store is not connected to this MCP hook, and the admin console has no visual Cedar editor. SBproxy does not compile natural-language prompts into Cedar. See [the policy catalog](policy.md#nl-to-cedar-decision) for that boundary.
+Cedar policies are authored in YAML. The embedded policy store is not connected to this MCP hook, and the admin console has no visual Cedar editor. sbproxy does not compile natural-language prompts into Cedar. See [the policy catalog](policy.md#nl-to-cedar-decision) for that boundary.
 
 ## See also
 

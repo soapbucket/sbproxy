@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-28*
 
-SBproxy is a reverse proxy first. Before it routes to an AI provider or federates an MCP server, it does the job Nginx, Envoy, or Kong do: match a hostname, authenticate the caller, apply rate limits and a WAF, load-balance across upstreams, and proxy the request. This guide is the entry point for that traditional pillar. If you are putting SBproxy in front of an existing HTTP API, or evaluating it as a replacement for a reverse proxy you already run, start here.
+sbproxy is a reverse proxy first. Before it routes to an AI provider or federates an MCP server, it does the job Nginx, Envoy, or Kong do: match a hostname, authenticate the caller, apply rate limits and a WAF, load-balance across upstreams, and proxy the request. This guide is the entry point for that traditional pillar. If you are putting sbproxy in front of an existing HTTP API, or evaluating it as a replacement for a reverse proxy you already run, start here.
 
 This page links out to deep-dive docs rather than restating them. For the full request lifecycle, read [core-concepts.md](core-concepts.md) first; for the four walkthroughs and the action catalog, see [all-traffic-gateway.md](all-traffic-gateway.md) and [features.md](features.md#6-reference-every-action-type); for the field-by-field schema, [configuration.md](configuration.md) is canonical.
 
@@ -95,7 +95,7 @@ Field-by-field reference: [configuration.md](configuration.md#api-deprecation-rf
 
 ## Protocols: HTTP/2, WebSocket, gRPC, and GraphQL
 
-Everything above assumes plain HTTP/1.1. SBproxy also terminates HTTP/2 and proxies WebSocket, gRPC, and GraphQL traffic through the same origin/auth/policy/transform pipeline as a `proxy` action.
+Everything above assumes plain HTTP/1.1. sbproxy also terminates HTTP/2 and proxies WebSocket, gRPC, and GraphQL traffic through the same origin/auth/policy/transform pipeline as a `proxy` action.
 
 **HTTP/2** is negotiated automatically over TLS: the HTTPS listener advertises `h2` via ALPN, so an HTTP/2-capable client gets it with no extra config once `https_bind_port` and a certificate are set. For a plaintext HTTP/2 listener (`h2c`), for example a gRPC client that never speaks TLS to the gateway, set `proxy.http2_cleartext: true` on the plain HTTP listener. See [configuration.md](configuration.md#proxy-fields) and the runnable [`examples/grpc-h2c/`](../examples/grpc-h2c/), which pairs the two.
 
@@ -108,7 +108,7 @@ Twelve built-in auth types cover the common cases: API key, Basic, Bearer, JWT (
 - [auth-oidc.md](auth-oidc.md) - the OIDC relying-party flow: authorization-code + PKCE, sealed session cookie, RP-initiated logout.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, rotate at runtime, hashed at rest.
 - [web-bot-auth.md](web-bot-auth.md) - verifying RFC 9421-signed crawlers against a published key directory.
-- [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained credentials for calls SBproxy makes upstream, as opposed to inbound caller auth.
+- [outbound-dpop.md](outbound-dpop.md) - RFC 9449 sender-constrained credentials for calls sbproxy makes upstream, as opposed to inbound caller auth.
 - [object-authz.md](object-authz.md) - BOLA/BFLA fine-grained access control once a caller is authenticated.
 
 **Examples:** [auth-jwt](../examples/auth-jwt/), [auth-forward](../examples/auth-forward/), [mtls-client-auth](../examples/mtls-client-auth/), [auth-api-key](../examples/auth-api-key/), [auth-basic](../examples/auth-basic/), [auth-digest](../examples/auth-digest/), [auth-bearer](../examples/auth-bearer/), [auth-bearer-dpop](../examples/auth-bearer-dpop/), [auth-cap](../examples/auth-cap/), [keys-inbound-headers](../examples/keys-inbound-headers/), [sessions](../examples/sessions/)
@@ -131,13 +131,13 @@ When declarative config is not enough, sbproxy gives you four extension surfaces
 
 ## OpenAPI and the admin API
 
-SBproxy can emit an OpenAPI 3.0 document from a live config ([openapi-emission.md](openapi-emission.md)) and validate incoming request bodies against one at startup ([openapi-validation.md](openapi-validation.md)). The admin API is the separate control plane for configuration, keys, metrics, and logs; start with [admin.md](admin.md) for what it is and [admin-api-guide.md](admin-api-guide.md) for a task-oriented walkthrough (login, CSRF, roles, curl cookbook). Keep it on a protected network; a successful data-plane request never requires an admin-plane one.
+sbproxy can emit an OpenAPI 3.0 document from a live config ([openapi-emission.md](openapi-emission.md)) and validate incoming request bodies against one at startup ([openapi-validation.md](openapi-validation.md)). The admin API is the separate control plane for configuration, keys, metrics, and logs; start with [admin.md](admin.md) for what it is and [admin-api-guide.md](admin-api-guide.md) for a task-oriented walkthrough (login, CSRF, roles, curl cookbook). Keep it on a protected network; a successful data-plane request never requires an admin-plane one.
 
 **Examples:** [openapi-emission](../examples/openapi-emission/), [openapi-validation](../examples/openapi-validation/)
 
 ## Where to next
 
-- New to SBproxy entirely? [getting-started.md](getting-started.md).
+- New to sbproxy entirely? [getting-started.md](getting-started.md).
 - Coming from Nginx, Envoy, Kong, or another reverse proxy and want the operational story (deploy, observe, upgrade)? [use-case-production-ops.md](use-case-production-ops.md), then [observability.md](observability.md) and [capacity-planning.md](capacity-planning.md).
 - Adding AI traffic to an API you already proxy? [ai-gateway.md](ai-gateway.md).
 - Adding MCP tool traffic? [mcp.md](mcp.md).

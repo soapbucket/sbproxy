@@ -1,7 +1,7 @@
 # Local inference for gateway helper models
 *Last modified: 2026-08-21*
 
-SBproxy can run four AI-gateway features on local ONNX models instead of paid
+sbproxy can run four AI-gateway features on local ONNX models instead of paid
 APIs:
 
 - The **embedding semantic cache** vectorizes prompts to serve near-duplicate
@@ -274,14 +274,14 @@ origins:
 An explicit `detector: sidecar` makes the sidecar primary and requires the
 verified local ONNX `fallback`; every primary transport, timeout, RPC,
 admission, or response-validation failure runs that fallback instead of
-admitting an unscored request. If `detector` is omitted instead, SBproxy
+admitting an unscored request. If `detector` is omitted instead, sbproxy
 attempts verified in-process auto-selection and uses `heuristic-v1` only when
 both resolved local artifacts are absent.
 
 ## Verified in-process selection
 
 For a single binary, run either feature in-process. This loads a model into the
-proxy address space. SBproxy enforces size and integrity checks before parsing;
+proxy address space. sbproxy enforces size and integrity checks before parsing;
 prefer the sidecar when process isolation matters.
 
 Each block sits in the same place as its sidecar form (the AI origin's

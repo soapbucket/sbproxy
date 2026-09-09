@@ -8,7 +8,7 @@ Which agent is this, and did we agree to let it in?
 The **catalog** answers the first. It is a list of known agents, their
 expected User-Agent strings, their reverse-DNS suffixes, their Web Bot Auth
 key thumbprints, and a reputation score, published as a file that somebody
-signs. SBproxy verifies the signature and keeps the result in memory.
+signs. sbproxy verifies the signature and keeps the result in memory.
 
 The **registration queue** answers the second. An agent that is not in
 anybody's catalog submits a description of itself, gets a client id and a
@@ -310,7 +310,7 @@ both answers. They are a size and two dates, not catalog contents.
 
 ## The signed catalog
 
-The catalog half needs two files, and SBproxy verifies both rather than
+The catalog half needs two files, and sbproxy verifies both rather than
 fetching either. There is no URL in this configuration on purpose: an
 outbound poller reachable from config is a fetch primitive, and syncing two
 files is something every deployment already knows how to do.
@@ -576,7 +576,7 @@ lossy under load the way every `events:` sink is.
 ## What this does not do
 
 It does not fetch. `feed_path` and `key_directory_path` are files you sync;
-SBproxy reads and verifies them at boot and on the refresh timer, and never
+sbproxy reads and verifies them at boot and on the refresh timer, and never
 dials for them.
 
 It does not expose an unauthenticated public registration endpoint. RFC 7591

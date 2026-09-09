@@ -1,14 +1,14 @@
-# Vercel AI SDK with SBproxy
+# Vercel AI SDK with sbproxy
 
 *Last modified: 2026-08-19*
 
-An AI SDK application normally talks to providers directly: the provider package calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an SBproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the AI SDK side the change is one provider instance with a `baseURL` and one MCP client pointed at the gateway.
+An AI SDK application normally talks to providers directly: the provider package calls `api.openai.com`, and each MCP tool server is a separate connection with its own credentials. Point both sides at an sbproxy you run and every model call and every tool call crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. On the AI SDK side the change is one provider instance with a `baseURL` and one MCP client pointed at the gateway.
 
 The snippets on this page are plain ES modules: save one as `app.mjs` and run it with `node app.mjs`. They work unchanged in a TypeScript project.
 
 ## Chat completions through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and the `@ai-sdk/openai-compatible` package is the client built for exactly that shape. Its default model type posts to `/v1/chat/completions` and sends your key as a `Bearer` token:
+sbproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and the `@ai-sdk/openai-compatible` package is the client built for exactly that shape. Its default model type posts to `/v1/chat/completions` and sends your key as a `Bearer` token:
 
 ```js
 import { generateText } from "ai";
@@ -127,7 +127,7 @@ The `app.mjs` snippet above works against the same stack unchanged. `docker comp
 
 ## MCP tools through the gateway
 
-SBproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
+sbproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
 
 A minimal `mcp` origin federating two upstream tool servers:
 

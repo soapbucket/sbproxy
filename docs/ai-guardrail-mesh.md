@@ -166,7 +166,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 Both return the provider's own chat completion, so the body depends on the
-model rather than on SBproxy. The difference between them is not visible in
+model rather than on sbproxy. The difference between them is not visible in
 the response: it is that the first one reached the provider with the address
 masked.
 

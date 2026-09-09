@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-21*
 
-SBproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
+sbproxy serves multiple tenants from a single binary. Each tenant gets its own configuration scope under `proxy.tenants[]`; origins bind to a tenant via `origin.tenant_id`; request-time resolution walks origin → tenant → proxy with most-specific-wins by name.
 
 This guide covers when to use the multi-tenant shape, how the three scopes compose, the isolation guarantees the proxy provides, and the `__default__` synthetic tenant that single-tenant deployments inherit transparently.
 
@@ -29,7 +29,7 @@ Resolution at request time walks origin → tenant → proxy. A block at a more 
 
 A tenant entry carries exactly three fields today: `id`, `credentials`, and `observability`. Policies stay at proxy and origin scope (there is no `tenants[].policies:` block), and secret backends are declared once at proxy scope under `proxy.secrets.backends:` (a per-tenant `vault:` block is a future direction, not a shipped key).
 
-A credential's `key:` is the value an inbound caller presents, and the policy, budget, and attribution attached to it are what that caller then gets. The provider key SBproxy swaps in on the way out is a different field, `providers[].api_key`, and it is the one that takes a `vault://` or `awssm://` reference.
+A credential's `key:` is the value an inbound caller presents, and the policy, budget, and attribution attached to it are what that caller then gets. The provider key sbproxy swaps in on the way out is a different field, `providers[].api_key`, and it is the one that takes a `vault://` or `awssm://` reference.
 
 ```yaml
 proxy:
@@ -204,7 +204,7 @@ What is NOT guaranteed:
 
 ## Per-tenant cardinality budgets
 
-Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. SBproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a `__other__` catch-all. The cardinality budget is split per tenant so a single noisy tenant cannot demote labels for every other tenant.
+Prometheus metric label cardinality is the single biggest operational risk in a multi-tenant deployment. sbproxy's cardinality limiter caps the unique label sets per metric family; a tenant that would push the proxy past the cap sees its newest label combinations demoted to a `__other__` catch-all. The cardinality budget is split per tenant so a single noisy tenant cannot demote labels for every other tenant.
 
 Configure the per-tenant cap on the tenant's observability block:
 

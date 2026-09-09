@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-08*
 
-SBproxy can use RFC 9449 Demonstrating Proof of Possession when an origin's
+sbproxy can use RFC 9449 Demonstrating Proof of Possession when an origin's
 `outbound_credential` acquires or carries a sender-constrained access token.
 The feature is opt-in. Existing outbound credentials continue to use their
 current Bearer behavior.
@@ -31,7 +31,7 @@ outbound_credential:
 ```
 
 `dpop.key` must be an existing provider URI or `file:` secret reference to a
-PKCS#8 PEM private key. Inline PEM is rejected, and SBproxy does not generate
+PKCS#8 PEM private key. Inline PEM is rejected, and sbproxy does not generate
 a key. The public-only `jwk` must match the private key and `alg`.
 
 For `vault_secret`, set `header: authorization` or leave the header at its
@@ -45,7 +45,7 @@ configurations stop the pipeline from loading. Validation commands check the
 reference and public configuration without contacting an external secret
 provider.
 
-On a token cache miss, SBproxy sends a fresh DPoP proof with the token endpoint
+On a token cache miss, sbproxy sends a fresh DPoP proof with the token endpoint
 POST. On every protected-resource attempt, including cache hits and retries, it
 sends a newly signed proof with:
 

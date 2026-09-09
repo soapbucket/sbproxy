@@ -4,11 +4,11 @@
 
 ![Minting a virtual key, calling OpenAI and Anthropic through one governed endpoint, reading the spend ledger, and tripping a budget cap](assets/use-case-own-openrouter.gif)
 
-Somewhere in your company there is an OpenAI key in a CI secret, an Anthropic key in a notebook, and a third key nobody remembers minting. Every tool points at a different provider, and when the invoice lands there is no way to say which team spent what. SBproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that puts a single OpenAI-compatible endpoint in front of 70 providers, or serves the weights on your own GPUs, with keys, budgets, and accounting under your control. This guide builds the hosted-gateway half of that sentence. In about twenty minutes you get your own OpenRouter, running on a box you own.
+Somewhere in your company there is an OpenAI key in a CI secret, an Anthropic key in a notebook, and a third key nobody remembers minting. Every tool points at a different provider, and when the invoice lands there is no way to say which team spent what. sbproxy's pitch is "Call any model. Serve your own. Govern both.": one Apache-2.0 binary that puts a single OpenAI-compatible endpoint in front of 70 providers, or serves the weights on your own GPUs, with keys, budgets, and accounting under your control. This guide builds the hosted-gateway half of that sentence. In about twenty minutes you get your own OpenRouter, running on a box you own.
 
 ## What you will build
 
-One endpoint on port 8080 that speaks the OpenAI API in front of OpenAI and Anthropic, where the request's `model` field picks the vendor. An admin API on port 9090 where you mint a virtual key per team at runtime; the real provider keys stay in the gateway's environment and teams only ever hold their SBproxy key. Each key carries a daily token budget that the gateway enforces before dispatch, refusing over-budget requests with `402`. And a usage ledger on disk that records every completed call with provider, model, tokens, cost, and the key that spent it, hash-chained so past entries cannot be quietly edited.
+One endpoint on port 8080 that speaks the OpenAI API in front of OpenAI and Anthropic, where the request's `model` field picks the vendor. An admin API on port 9090 where you mint a virtual key per team at runtime; the real provider keys stay in the gateway's environment and teams only ever hold their sbproxy key. Each key carries a daily token budget that the gateway enforces before dispatch, refusing over-budget requests with `402`. And a usage ledger on disk that records every completed call with provider, model, tokens, cost, and the key that spent it, hash-chained so past entries cannot be quietly edited.
 
 ## Prerequisites
 

@@ -21,7 +21,7 @@ assumes the runtime, not the config, decides what argv runs.
 
 ## The decision: keep the typed-driver seam
 
-A new engine enters SBproxy as a first-party typed driver, not as
+A new engine enters sbproxy as a first-party typed driver, not as
 operator-supplied argv. The SGLang driver is the template. A driver declares
 its capabilities (artifact formats, accelerators, container and uv support),
 detects what is installed or acquirable on the worker, provisions a pinned
@@ -38,7 +38,7 @@ device the placement did not assign. A command template dissolves all of that
 at once. There is no partial version of this trade: either the runtime
 constructs the argv or the config does.
 
-This costs coverage. An engine SBproxy has no driver for cannot be launched by
+This costs coverage. An engine sbproxy has no driver for cannot be launched by
 the model host. We accept that cost because writing a driver is bounded,
 well-understood work against an existing trait, and because the alternative
 breaks the property the whole model-host security story rests on.
@@ -64,7 +64,7 @@ origins:
 ```
 
 You launch TensorRT-LLM, Kokoro, or your in-house container however you launch
-things; SBproxy routes to it and applies guardrails, budgets, keys, and the
+things; sbproxy routes to it and applies guardrails, budgets, keys, and the
 spend ledger, without ever holding launch authority over it. The division of
 labor is explicit instead of hidden inside a command template.
 [use-case-guardrails-everywhere.md](use-case-guardrails-everywhere.md) walks
@@ -83,7 +83,7 @@ up with real deployments behind it, the answer is a typed driver for that
 engine. That grows coverage where demand is proven and keeps the seam intact.
 
 **A signed engine-descriptor design.** There may eventually be a middle path:
-third-party engines described by a manifest SBproxy verifies rather than code
+third-party engines described by a manifest sbproxy verifies rather than code
 it must ship. Any such design has a minimum bar before it is worth
 considering:
 

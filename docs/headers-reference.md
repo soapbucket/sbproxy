@@ -1,7 +1,7 @@
 # Headers reference
 *Last modified: 2026-08-21*
 
-Every header SBproxy reads or stamps, with the config that triggers it.
+Every header sbproxy reads or stamps, with the config that triggers it.
 This is the single source of truth; `docs/manual.md` and the marketing
 pages link here rather than duplicating the table inline.
 
@@ -89,7 +89,7 @@ Stamped on event-sink, audit-log-sink, and callback deliveries
 
 | Header | Description |
 |---|---|
-| `x-sbproxy-instance` | Stable identifier for the SBproxy instance that emitted the webhook. |
+| `x-sbproxy-instance` | Stable identifier for the sbproxy instance that emitted the webhook. |
 | `x-sbproxy-config-revision` | The compiled-config revision that produced the event. |
 | `x-sbproxy-timestamp` | Unix ms when the webhook was dispatched. |
 | `x-sbproxy-event` | The event type (e.g. `ai.request.completed`, `policy.violation`, `audit.session_close`). |
@@ -142,7 +142,7 @@ Proxy-Status: sbproxy; received-status=502; error="connection_terminated"
 
 The error token catalog mirrors RFC 9209 section 2.3.4
 (`connection_refused`, `connection_timeout`, `tls_protocol_error`,
-`connection_terminated`, `http_request_error`), plus one SBproxy
+`connection_terminated`, `http_request_error`), plus one sbproxy
 extension token that section 2.3 provides for:
 
 | Token | Status | Meaning |

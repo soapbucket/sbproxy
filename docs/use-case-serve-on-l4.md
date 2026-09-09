@@ -59,7 +59,7 @@ The [manual](manual.md) covers checksums, packages, and the rest of the install 
 
 ## Minimal config (stand-in)
 
-Save this as `sb.yml`. It is [`examples/use-case-serve-on-l4/sb.yml`](../examples/use-case-serve-on-l4/sb.yml), and its shape comes from [`examples/ai-local-serving`](../examples/ai-local-serving). This config names llama.cpp and a GGUF file. This walkthrough tests that configuration on CPU and Apple Metal. SBproxy also supports digest-pinned CUDA llama.cpp source builds, but they are not the certified NVIDIA path for this guide. See [NVIDIA L4](#nvidia-l4) for that path.
+Save this as `sb.yml`. It is [`examples/use-case-serve-on-l4/sb.yml`](../examples/use-case-serve-on-l4/sb.yml), and its shape comes from [`examples/ai-local-serving`](../examples/ai-local-serving). This config names llama.cpp and a GGUF file. This walkthrough tests that configuration on CPU and Apple Metal. sbproxy also supports digest-pinned CUDA llama.cpp source builds, but they are not the certified NVIDIA path for this guide. See [NVIDIA L4](#nvidia-l4) for that path.
 
 ```yaml
 proxy:

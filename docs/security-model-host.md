@@ -51,7 +51,7 @@ There is no free-form shell command. Engine kind, launch method, acceleration,
 image, version, digest, path, and shared-memory size are typed fields. The
 runtime constructs the remaining argv and environment.
 
-An explicit `path` is still executable authority. SBproxy checks that it is an
+An explicit `path` is still executable authority. sbproxy checks that it is an
 executable file and uses it as the selected engine; it does not prove that an
 operator path contains an authentic llama.cpp or vLLM binary. Restrict config
 writers, make engine directories root-owned, and prefer pinned managed

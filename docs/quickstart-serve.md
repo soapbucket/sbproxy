@@ -15,14 +15,14 @@ sbproxy models list
 
 ## Start a model
 
-Install SBproxy if necessary, then start the small bootstrap model:
+Install sbproxy if necessary, then start the small bootstrap model:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
 sbproxy run qwen2.5-0.5b-instruct --variant q4_k_m
 ```
 
-The first run downloads the selected artifact and the engine it needs. Keep this terminal open. SBproxy does not announce readiness until the model can answer requests.
+The first run downloads the selected artifact and the engine it needs. Keep this terminal open. sbproxy does not announce readiness until the model can answer requests.
 
 The ready output names a loopback endpoint, usually `http://127.0.0.1:8080`, and prints `OPENAI_BASE_URL` plus an API-key placeholder for SDKs that require one. It also prints a generated loopback admin credential. Treat that password as a secret.
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-26*
 
-SBproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
+sbproxy heavily invests in out-of-process AI safety via the `sbproxy-classifier-sidecar`, `sbproxy-classifier`, and `sbproxy-classifier-client` crates. These components allow you to run remote or local Machine Learning safety classifiers (e.g., prompt injection detection, PII detection, toxicity) outside of the main proxy process using gRPC, plus (for `sbproxy-classifier`) TCP + MessagePack.
 
 Two sidecar binaries exist, both built from this OSS tree, and a caller reaches either through the same `sbproxy-classifier-client`:
 
@@ -13,11 +13,11 @@ Running the primary classifier in a sidecar isolates its process: if that model 
 
 ## 1. The `InferenceService` Contract
 
-SBproxy communicates with classifier sidecars via a protobuf contract named `InferenceService`, defined in `crates/sbproxy-classifier-proto/proto/classifier.proto`. Any gRPC service that implements this contract can be used as a classifier backend.
+sbproxy communicates with classifier sidecars via a protobuf contract named `InferenceService`, defined in `crates/sbproxy-classifier-proto/proto/classifier.proto`. Any gRPC service that implements this contract can be used as a classifier backend.
 
 The contract defines five RPCs: `Classify`, `Embed`, and `Compress` on the hot request path, plus `ModelInfo` and `Version` as capability probes. The proxy submits one text string at a time to `Classify` (usually a canonicalized prompt or assistant response) and gets back an array of scored labels, highest score first. `sbproxy-classifier-client` exposes `Version` (sidecar build and the model ids it can serve) and `ModelInfo` (per-model description) as public calls a custom integration can use to check a sidecar before relying on it; the in-tree policy and compression levers dial `Classify`, `Embed`, and `Compress` directly and do not call either probe today.
 
-The sidecar that ships with SBproxy (`sbproxy-classifier-sidecar`) implements this contract and wraps the pure-Rust `tract` ONNX runtime. It can load `bert`-style classification models (such as a fine-tuned `deberta-v3-base` prompt-injection classifier) to evaluate traffic in real time.
+The sidecar that ships with sbproxy (`sbproxy-classifier-sidecar`) implements this contract and wraps the pure-Rust `tract` ONNX runtime. It can load `bert`-style classification models (such as a fine-tuned `deberta-v3-base` prompt-injection classifier) to evaluate traffic in real time.
 
 ## 2. Running the Sidecar
 
@@ -37,7 +37,7 @@ cargo run -p sbproxy-classifier-sidecar -- \
 
 ### Unix Domain Socket
 
-`--listen-uds <path>` is the transport SBproxy's own supervised child-process wiring (`sbproxy-classifier-client`'s `Supervisor`) uses for a co-located sidecar it spawns itself. It removes the loopback TCP round trip for that pattern:
+`--listen-uds <path>` is the transport sbproxy's own supervised child-process wiring (`sbproxy-classifier-client`'s `Supervisor`) uses for a co-located sidecar it spawns itself. It removes the loopback TCP round trip for that pattern:
 
 ```bash
 cargo run -p sbproxy-classifier-sidecar -- \
@@ -285,7 +285,7 @@ Because the proxy uses a standard gRPC contract, you can build a custom sidecar 
 
 To do this, you simply need to implement the `InferenceService` protobuf (located in `crates/sbproxy-classifier-proto/proto/classifier.proto`) and expose the `Classify` endpoint. A `prompt_injection_v2` detector only ever calls `Classify`, so that RPC is enough to back it. Implement `Embed` and `Compress` as well if your sidecar backs the semantic cache or token pruning; those levers call the matching RPC directly. `ModelInfo` and `Version` are part of the same contract for a caller that wants to probe a sidecar's loaded models before dispatch, but nothing in this tree calls either one today.
 
-When SBproxy encounters an AI request with a sidecar-backed guardrail, it automatically:
+When sbproxy encounters an AI request with a sidecar-backed guardrail, it automatically:
 1. Buffers and canonicalizes the request (e.g. assembling all messages into a unified prompt).
 2. Connects to your sidecar via the `sbproxy-classifier-client` (which handles lazy connection and, for the supervised co-located pattern, UDS dialing).
 3. Invokes `Classify` with the text payload.

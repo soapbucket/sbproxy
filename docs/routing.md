@@ -1,7 +1,7 @@
 # Routing and traffic management
 *Last modified: 2026-08-28*
 
-How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
+How sbproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
 ![The same hostname routed to different backends by request body content](assets/body-routing.gif)
 
@@ -31,7 +31,7 @@ flowchart TD
 
 ## How a request finds an origin
 
-Each key under `origins:` is a hostname. SBproxy matches the inbound `Host` header (or `:authority` on HTTP/2+) against those keys and runs that origin's configuration.
+Each key under `origins:` is a hostname. sbproxy matches the inbound `Host` header (or `:authority` on HTTP/2+) against those keys and runs that origin's configuration.
 
 - Exact match beats wildcard. Between wildcards, the longest matching suffix wins.
 - A wildcard's `*` must be the complete first label (`*.example.com`, not `a*.example.com`).

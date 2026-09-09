@@ -1988,7 +1988,7 @@ record endpoint places the same object in `record`.
 | `logical_version` | int | Monotonic version within the current retained record lineage. Delete or expiry allows a later lineage to restart at 1. |
 | `protected_prefix_count` | int | Count of leading system or developer messages protected verbatim. |
 | `covered_history_count` | int | Count of original history messages represented by the summary. |
-| `covered_input_tokens` | int | SBproxy model-aware token estimate represented by that covered history. |
+| `covered_input_tokens` | int | sbproxy model-aware token estimate represented by that covered history. |
 | `summary_tokens` | int | Bounded summarizer output token count, not its content. |
 | `summarizer_provider` | string | Configured internal summarizer provider name. |
 | `summarizer_model` | string | Configured internal summarizer model name. |
@@ -3204,11 +3204,11 @@ Read-only operators may call this.
 
 Runtime tracing-filter control, no restart required.
 
-Official release binaries compile SBproxy's own `debug!` and `trace!` events
+Official release binaries compile sbproxy's own `debug!` and `trace!` events
 out with a static maximum of `info`. This endpoint changes the runtime filter;
 it cannot restore events absent from the binary. A `debug` or `trace` filter
 may still reveal dependency events compiled without that ceiling. Use a
-development build when troubleshooting requires SBproxy-internal debug or
+development build when troubleshooting requires sbproxy-internal debug or
 trace events.
 
 `GET` returns `{"level": "info"}` (or whatever directive is active,

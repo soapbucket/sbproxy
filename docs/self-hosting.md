@@ -1,4 +1,4 @@
-# Self-hosting SBproxy
+# Self-hosting sbproxy
 
 *Last modified: 2026-08-21*
 
@@ -6,7 +6,7 @@ One binary to self-host your AI gateway, and the same binary runs the
 models. OpenRouter proved that teams want unified routing, fallbacks,
 virtual keys, and spend accounting in front of every model they call.
 That product is pure brokerage: it forwards your request to whoever
-hosts the model. SBproxy brings the same feature surface inside your
+hosts the model. sbproxy brings the same feature surface inside your
 network and adds the half a hosted router cannot: the weights run on
 your GPUs, and the tokens never leave the box.
 
@@ -95,7 +95,7 @@ to the first request, or `manual` to require a prior `sbproxy models pull`.
 at all: build capabilities, visible devices, engines on PATH, container
 runtime, the model cache, and a local-runtime verdict with every
 blocker listed. When a container runtime is present, that is the path
-SBproxy prefers for a GPU engine: it pulls a digest-pinned image and
+sbproxy prefers for a GPU engine: it pulls a digest-pinned image and
 runs the engine in a container, so the host needs only an NVIDIA driver
 and no Python or CUDA build toolchain. For each engine doctor names the
 acquisition options viable here (a pinned llama.cpp release, a
@@ -199,14 +199,14 @@ origins:
 
 ## Grown-up auth in front of local inference
 
-Ollama's own FAQ tells you to put nginx in front of it. SBproxy is that
+Ollama's own FAQ tells you to put nginx in front of it. sbproxy is that
 front, with a ledger and a policy engine behind it: virtual keys,
 per-team quotas, hierarchical budgets, and the guardrail mesh all apply
 to the local model the same way they apply to a hosted one.
 
 It also tells you what the GPU is worth. On the compatibility `serve:`
 path, give a served model a `reference:` block naming the hosted model it
-displaces and that model's per-million-token price, and SBproxy prices
+displaces and that model's per-million-token price, and sbproxy prices
 every completion it serves locally at what the hosted API would have
 charged. A local completion costs nothing at the API, so the whole
 displaced price is the saving:
@@ -228,7 +228,7 @@ providers:
 
 `GET /admin/model-host/value` then reports the running total: local and
 cloud completion counts per model and the dollars each local completion
-saved. Leave `reference:` off and SBproxy makes no savings claim for that
+saved. Leave `reference:` off and sbproxy makes no savings claim for that
 model; it never guesses a cloud price.
 
 ## A public endpoint with Let's Encrypt
@@ -293,12 +293,12 @@ and the cases there where this block is still the better choice.
 
 ## OpenRouter parity map
 
-What OpenRouter offers and the SBproxy equivalent. Honest about the gap:
+What OpenRouter offers and the sbproxy equivalent. Honest about the gap:
 OpenRouter brokers a 400-plus-model hosted marketplace; we route to 70
 hosted providers plus your own GPUs. Everything in the right-hand column
 is in the same Apache-2.0 binary.
 
-| OpenRouter | SBproxy |
+| OpenRouter | sbproxy |
 |---|---|
 | Unified API across providers | One OpenAI/Anthropic-shaped API across 70 providers plus local engines |
 | Model catalog | Model manifest: source, pinning, sha256 digests, pull policy |

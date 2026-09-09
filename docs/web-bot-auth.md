@@ -178,7 +178,7 @@ signer still depends on the old shape before the fallback is removed.
 
 ## Agent-class resolver relationship
 
-When `bot_auth` verifies a request, SBproxy carries the verified `keyid` on the unified principal as `attrs.metadata.bot_auth_keyid`. If the agent-class resolver is enabled and the active catalog has an entry whose `expected_keyids` contains that value, the request context is restamped with `agent_id_source = bot_auth` before upstream request headers and per-agent metrics are emitted.
+When `bot_auth` verifies a request, sbproxy carries the verified `keyid` on the unified principal as `attrs.metadata.bot_auth_keyid`. If the agent-class resolver is enabled and the active catalog has an entry whose `expected_keyids` contains that value, the request context is restamped with `agent_id_source = bot_auth` before upstream request headers and per-agent metrics are emitted.
 
 That key ID verdict is the resolver's highest-confidence signal. It outranks reverse DNS and User-Agent matches, so a request with a valid WBA signature for `openai-2026-01` but a spoofed `User-Agent: SpoofBot/1.0` resolves to the catalog entry that owns `openai-2026-01`. Set `agent_classes.resolver.bot_auth_keyid_enabled: false` to disable this step and fall back to rDNS / UA matching.
 
@@ -216,9 +216,9 @@ origins:
 
 A signed crawler still pays per request unless its `Crawler-Payment` token redeems. An unsigned client never reaches the policy. This gives operators two independent gates: identity (bot_auth) and metering (ai_crawl_control).
 
-## Publishing SBproxy's own directory
+## Publishing sbproxy's own directory
 
-When SBproxy signs its own outbound requests (e.g. fanning out to AI APIs that demand Web Bot Auth), verifiers need to discover the key SBproxy signs with. Opt the origin into publishing its own JWKS-shaped directory + Signature Agent Card:
+When sbproxy signs its own outbound requests (e.g. fanning out to AI APIs that demand Web Bot Auth), verifiers need to discover the key sbproxy signs with. Opt the origin into publishing its own JWKS-shaped directory + Signature Agent Card:
 
 ```yaml
 origins:
@@ -230,7 +230,7 @@ origins:
       enabled: true
       key_id: "sbproxy-key-2026-05-31"
       public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-      agent_name: "SBproxy"
+      agent_name: "sbproxy"
       directory_url: "https://agent.example.com/.well-known/http-message-signatures-directory"
       description: "Outbound AI gateway with Web Bot Auth signing."
       contact_url: "mailto:abuse@example.com"
@@ -252,7 +252,7 @@ web_bot_auth_publish:
   enabled: true
   key_id: "sbproxy-key-2026-05-31"
   public_key_hex: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-  agent_name: "SBproxy"
+  agent_name: "sbproxy"
   directory_url: "https://agent.example.com/.well-known/http-message-signatures-directory"
   # Optional. Hex-encoded 32-byte Ed25519 seed; secret references work.
   signing_key_hex: "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"

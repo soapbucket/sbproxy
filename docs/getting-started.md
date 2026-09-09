@@ -2,11 +2,11 @@
 
 *Last modified: 2026-08-28*
 
-This walkthrough runs one local upstream through three gateway configurations. It is the command path for [all-traffic-gateway.md](all-traffic-gateway.md). It needs SBproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
+This walkthrough runs one local upstream through three gateway configurations. It is the command path for [all-traffic-gateway.md](all-traffic-gateway.md). It needs sbproxy, `curl`, and `jq`. It makes no network request to an AI provider and needs no API key.
 
 On Windows, run the commands in Git Bash, or replace `curl` with `curl.exe` in PowerShell: the bare name is an alias for `Invoke-WebRequest` there and rejects flags like `-H`.
 
-SBproxy binds its data listener to all host interfaces (`0.0.0.0`) by
+sbproxy binds its data listener to all host interfaces (`0.0.0.0`) by
 default. Run this walkthrough on a trusted development machine or behind a
 host firewall. The commands connect through `127.0.0.1`, and the cleanup
 section stops both listeners when you finish. To bind to loopback only,
@@ -14,7 +14,7 @@ set `proxy.bind_address: "127.0.0.1"` in the config; it applies to both
 `http_bind_port` and `https_bind_port` together, so one setting cannot
 leave HTTPS open while HTTP is closed.
 
-Install SBproxy first if `sbproxy --version` does not print a version:
+Install sbproxy first if `sbproxy --version` does not print a version:
 
 ```bash
 curl -fsSL https://download.sbproxy.dev | sh
@@ -62,7 +62,7 @@ sbproxy serve -f examples/enterprise-ai-gateway/api.yml
 
 `api.yml` binds the gateway to port `8080`. Its `api.example.com` origin has a `proxy` action whose upstream URL is `http://127.0.0.1:8091`. The `Host` header selects that origin, so the client can reach a local listener while still exercising hostname routing.
 
-SBproxy blocks proxy upstreams that resolve to private IP addresses by
+sbproxy blocks proxy upstreams that resolve to private IP addresses by
 default. This local example opts into only the IPv4 loopback range with
 `proxy.extensions.upstream.allow_private_cidrs: [127.0.0.0/8]`. Keep that
 allowlist as narrow as possible; a production service on a public address

@@ -166,7 +166,7 @@ HashiCorp Vault owns `vault://` after the migration, so a HashiCorp reference sh
 vault://primary/secret/data/openai-prod?key=api_key
 ```
 
-The legacy `vault://<alias>/...` forms are still accepted with a warning as of SBproxy 1.5.0; a removal release has not been announced. Rewrite known aliases with:
+The legacy `vault://<alias>/...` forms are still accepted with a warning as of sbproxy 1.5.0; a removal release has not been announced. Rewrite known aliases with:
 
 ```bash
 sbproxy config migrate sb.yml --out sb.migrated.yml
@@ -187,7 +187,7 @@ A list of selectors. A selector matches when at least one of its fields matches 
 
 Empty `principals: []` matches every principal. When a presented credential key
 matches but none of its selector rows match the already-resolved inbound
-principal, SBproxy rejects the request with `403` before applying that
+principal, sbproxy rejects the request with `403` before applying that
 credential's attribution, model route override, tool injection, or provider
 dispatch.
 
@@ -197,7 +197,7 @@ dispatch.
 matching origin's AI handler to have request-body PII redaction enabled before
 the credential can dispatch upstream. Rule names are checked against the active
 default and custom PII rules. If a required rule is missing, or `pii.enabled` /
-`pii.redact_request` disables request redaction, SBproxy rejects the request
+`pii.redact_request` disables request redaction, sbproxy rejects the request
 before provider dispatch and emits a structured warning.
 
 ## What's deferred

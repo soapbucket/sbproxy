@@ -8,7 +8,7 @@
 
 *The recording shows the gateway's Anthropic format bridge against a hosted Claude upstream. A recording of this page's config, with the model running on a local GPU, is still to come.*
 
-Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. SBproxy closes that gap with one Apache-2.0 binary that routes to 70 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
+Your coding assistant streams your source code to somebody else's cloud, and the meter runs the whole session. Meanwhile the GPU in your workstation sits idle. sbproxy closes that gap with one Apache-2.0 binary that routes to 70 providers or serves the weights on your own hardware: "Call any model. Serve your own. Govern both." This page sets up the serving half and points Claude Code, Cline, and Continue at it.
 
 One status note up front. The managed runtime, verified artifact path, typed engines, admission, and reload transaction are implemented. Apple Silicon Metal and single-GPU NVIDIA CUDA (live vLLM) are both certified on real hardware. Multi-GPU and a live three-node GCP fleet remain unsupported, blocked by a one-GPU billing quota cap rather than by missing code. `sbproxy doctor` reports what your current box can do; [model-host-certification.md](model-host-certification.md) keeps the exact boundary.
 
@@ -19,7 +19,7 @@ A gateway on port 8080 that hosts Qwen3 14B on your GPU and answers to the name 
 ## Prerequisites
 
 - A host with an NVIDIA GPU and driver. `sbproxy doctor` tells you whether the box qualifies and lists every blocker when it does not.
-- An inference engine, which SBproxy acquires for you on first use: it fetches a pinned `llama-server` prebuilt for GGUF weights, or fetches `uv` and runs vLLM through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch, so installing your own build also works.
+- An inference engine, which sbproxy acquires for you on first use: it fetches a pinned `llama-server` prebuilt for GGUF weights, or fetches `uv` and runs vLLM through `uv tool run` for safetensors. A binary already on `PATH` is preferred over any fetch, so installing your own build also works.
 - `curl` for testing and `jq` for readable output.
 - Claude Code, Cline, or Continue on the machine you code from.
 

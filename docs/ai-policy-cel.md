@@ -80,7 +80,7 @@ did not select.
 
 The full selector precedence is `X-Compression` header, governed key
 `compression_profile`, CEL, then the route default. A caller header therefore
-overrides a CEL decision. SBproxy strips that header before sending the request
+overrides a CEL decision. sbproxy strips that header before sending the request
 upstream. See [AI context compression](ai-context-compression.md#profiles-and-request-selection)
 for the shared grammar and rejection rules.
 

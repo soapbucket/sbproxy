@@ -1,10 +1,10 @@
-# Taking SBproxy on-call: metrics, logs, and your first incident
+# Taking sbproxy on-call: metrics, logs, and your first incident
 
 *Last modified: 2026-08-21*
 
 ![Terminal recording: traffic flows through three origins, a dead upstream returns 502, the fallback origin serves a degraded 200, and the failure shows up in /metrics and the JSON access log](assets/use-case-production-ops.gif)
 
-The gateway works on your laptop, and now someone wants it in production, which means someone (probably you) gets paged when it misbehaves at 3am. Before that page fires you want to know what the process exposes: which numbers move when an upstream dies, where the log line for a failed request lands, and what the gateway does on its own while you are still finding your glasses. SBproxy's pitch is "Call any model. Serve your own. Govern both.", and the operational half of that promise is that the same Apache-2.0 binary that routes to 70 providers or serves weights on your own GPUs also ships the metrics endpoint, the structured access log, the health probes, and the self-healing behavior this page walks through. Everything an on-call shift needs was already in the process you deployed; this page is about learning where it all is before the pager teaches you.
+The gateway works on your laptop, and now someone wants it in production, which means someone (probably you) gets paged when it misbehaves at 3am. Before that page fires you want to know what the process exposes: which numbers move when an upstream dies, where the log line for a failed request lands, and what the gateway does on its own while you are still finding your glasses. sbproxy's pitch is "Call any model. Serve your own. Govern both.", and the operational half of that promise is that the same Apache-2.0 binary that routes to 70 providers or serves weights on your own GPUs also ships the metrics endpoint, the structured access log, the health probes, and the self-healing behavior this page walks through. Everything an on-call shift needs was already in the process you deployed; this page is about learning where it all is before the pager teaches you.
 
 ## What you will build
 
@@ -190,7 +190,7 @@ cd examples/use-case-production-ops
 docker compose up -d
 ```
 
-Grafana is at `http://localhost:3000` (admin / admin) with the SBproxy folder pre-provisioned. Ten dashboards ship today. The two you will live in are `sbproxy-overview.json` (request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth) and `sbproxy-origins.json` (the same story per origin, which is how you tell "everything is down" from "checkout is down"). The rest are feature-area views: `sbproxy-security.json` for WAF, rate-limit, and auth blocks, `sbproxy-ai-gateway.json` for provider rates, tokens, TTFT, and fallbacks, `sbproxy-ai-value.json` for per-tenant and per-credential spend, `sbproxy-ai-bot-traffic.json`, `sbproxy-policy-verdicts.json`, `sbproxy-judge-backend.json`, `sbproxy-model-host.json` for GPU serving, and `sbproxy-mesh-storage.json` for mesh inbound admission and the storage backend behind it. `dashboards/README.md` has the full table.
+Grafana is at `http://localhost:3000` (admin / admin) with the sbproxy folder pre-provisioned. Ten dashboards ship today. The two you will live in are `sbproxy-overview.json` (request rate, latency percentiles, error rate, active connections, cache hit ratio, bandwidth) and `sbproxy-origins.json` (the same story per origin, which is how you tell "everything is down" from "checkout is down"). The rest are feature-area views: `sbproxy-security.json` for WAF, rate-limit, and auth blocks, `sbproxy-ai-gateway.json` for provider rates, tokens, TTFT, and fallbacks, `sbproxy-ai-value.json` for per-tenant and per-credential spend, `sbproxy-ai-bot-traffic.json`, `sbproxy-policy-verdicts.json`, `sbproxy-judge-backend.json`, `sbproxy-model-host.json` for GPU serving, and `sbproxy-mesh-storage.json` for mesh inbound admission and the storage backend behind it. `dashboards/README.md` has the full table.
 
 Prometheus at `http://localhost:9090` evaluates the bundled rules from `dashboards/prometheus/`. The alert file starts with the five you would write yourself anyway:
 
@@ -234,7 +234,7 @@ If the timeline says the incident started when a config change landed, roll the 
 - `checkout.local` returns `HTTP/1.1 502 Bad Gateway` and `curl -s localhost:8080/metrics | grep 'status="502"'` shows a non-zero `sbproxy_requests_total` counter for it.
 - `payments.local` returns `200` with `"status":"degraded"` in the body, proving the fallback origin is absorbing the same failure.
 - The 502 produced a JSON access-log line on stdout with no `upstream_ttfb_ms` field.
-- `curl -s http://127.0.0.1:9091/readyz` returns 200, and with the Compose stack up, the Grafana SBproxy folder shows the bundled dashboards and the Prometheus alerts page lists the `sbproxy_alerts` group.
+- `curl -s http://127.0.0.1:9091/readyz` returns 200, and with the Compose stack up, the Grafana sbproxy folder shows the bundled dashboards and the Prometheus alerts page lists the `sbproxy_alerts` group.
 
 ## Next steps
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-21*
 
-The exact bytes SBproxy puts on the wire when a request has to be paid
+The exact bytes sbproxy puts on the wire when a request has to be paid
 for, and the exact bytes it accepts back. This page is the wire reference.
 The operator guide to configuring settlement is
 [payment-settlement.md](payment-settlement.md), and the policy that
@@ -12,14 +12,14 @@ decides which requests are payable is
 ## The flow this contract describes
 
 1. The route computes a price.
-2. SBproxy builds one normalized requirement from that price and
+2. sbproxy builds one normalized requirement from that price and
    `proxy.payments`, and from nothing else.
 3. The client says which method it prefers.
-4. SBproxy signs the requirement, persists it as a pending intent, and
+4. sbproxy signs the requirement, persists it as a pending intent, and
    answers 402 with one protocol challenge.
 5. The client fulfills the challenge and retries with the protocol
    credential.
-6. SBproxy verifies the credential locally, then performs the rail's
+6. sbproxy verifies the credential locally, then performs the rail's
    required verification and settlement inside one bounded deadline.
 7. SQLite records the settlement.
 8. Only then does the origin see the request.

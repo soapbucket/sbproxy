@@ -16,7 +16,7 @@ review its Rust source and the changelog for the release you plan to run.
 
 ### `stable`
 
-A `stable` field is part of the committed public API of SBproxy.
+A `stable` field is part of the committed public API of sbproxy.
 
 - The field name, type, and default value will not change in a minor or patch release.
 - Removing or renaming a `stable` field requires a major version bump (e.g. v1 -> v2) and a migration guide.
@@ -346,7 +346,7 @@ protocol are identical, so the config compiles unchanged and the change is
 invisible until traffic hits it.
 
 **What changed.** The enterprise provider read an empty (or absent)
-`headers_to_forward` as "forward every request header". SBproxy reads it as
+`headers_to_forward` as "forward every request header". sbproxy reads it as
 what it says: an allowlist, and an empty allowlist forwards nothing. The
 first request after an operator set only `url` used to ship `Authorization`,
 `Cookie`, and every internal trust header to the authorization service; now
@@ -672,7 +672,7 @@ returns 400, and the client address that reaches the access log, the WAF, and
 the IP-filter policy is the load balancer's rather than the client's.
 
 **What to do before upgrading.** Turn PROXY protocol off on the load balancer
-in front of SBproxy and pass the client address in a header
+in front of sbproxy and pass the client address in a header
 (`X-Forwarded-For`) instead.
 
 ### Redis-backed idempotency entries move to a new keyspace
@@ -957,7 +957,7 @@ read for this at all.
 
 **What changes.** Bedrock does not answer a guardrail block with an error
 status. `Converse` returns 200 with `stopReason: guardrail_intervened` and an
-empty completion. SBproxy read neither: `body_refinable_client_status`
+empty completion. sbproxy read neither: `body_refinable_client_status`
 classifies only 400 and 422, and the failure-cause matcher has no `guardrail`
 substring, so the intervention relayed to the caller as a successful, empty
 completion, was admitted to the semantic cache and the idempotency store, and
@@ -1283,7 +1283,7 @@ codings the caller accepts. Two consequences for an existing config:
 | `credentials.source` | string | `default_chain` | **beta** | `default_chain`, `static`, or `assume_role`. |
 | `credentials.access_key_id` | string | - | **beta** | Read by `static` only. |
 | `credentials.secret_access_key` | string | - | **beta** | Read by `static` only. Secret-resolving. |
-| `credentials.session_token` | string | - | **beta** | Read by `static` only. Secret-resolving. Not renewable by SBproxy. |
+| `credentials.session_token` | string | - | **beta** | Read by `static` only. Secret-resolving. Not renewable by sbproxy. |
 | `credentials.role_arn` | string | - | **beta** | Read by `assume_role` only. |
 | `credentials.external_id` | string | - | **beta** | Read by `assume_role` only. Secret-resolving. |
 | `credentials.session_name` | string | `sbproxy` | **beta** | Read by `assume_role` only. |
@@ -1303,7 +1303,7 @@ surface as a config error rather than as a silently unsigned request.
 |---|---|---|---|---|
 | `identifier` | string | required | **beta** | Sent as `guardrailIdentifier`. Refused when blank. |
 | `version` | string | required | **beta** | Sent as `guardrailVersion`. `DRAFT` selects the working version. Refused when blank. |
-| `trace` | bool | `false` | **beta** | Sent as `trace: enabled`/`disabled`. Enables the assessment SBproxy reads to name the policies in the block reason; the trace is never relayed to the caller. |
+| `trace` | bool | `false` | **beta** | Sent as `trace: enabled`/`disabled`. Enables the assessment sbproxy reads to name the policies in the block reason; the trace is never relayed to the caller. |
 
 The whole block is **beta** for its first release. Unknown keys inside it are
 refused rather than ignored, and the block itself is refused on any provider

@@ -1,7 +1,7 @@
 # Cloudflare Code Mode
 *Last modified: 2026-08-19*
 
-SBproxy can emit a typed TypeScript module covering every tool in the
+sbproxy can emit a typed TypeScript module covering every tool in the
 MCP federation registry. Agents written against the [Cloudflare Code
 Mode](https://blog.cloudflare.com/code-mode/) runtime can import the
 module and invoke each tool as an ordinary async function. Code Mode

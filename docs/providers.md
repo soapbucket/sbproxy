@@ -1,7 +1,7 @@
 # Supported providers
 *Last modified: 2026-08-21*
 
-SBproxy ships native adapters for 70 LLM providers behind one OpenAI-compatible API. The 70 breaks down as: 63 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 4 `Custom`-format entries (SageMaker, Oracle, Watsonx, Writer) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
+sbproxy ships native adapters for 70 LLM providers behind one OpenAI-compatible API. The 70 breaks down as: 63 entries that speak the OpenAI wire format and pass through unchanged, 3 with in-tree request and response translators (Anthropic, Gemini, Bedrock), and 4 `Custom`-format entries (SageMaker, Oracle, Watsonx, Writer) that pass through in their native shape with no translation. You bring your own key per provider, and the `model` field passes straight through to the upstream, so the gateway reaches 200+ models (and whatever a provider ships next) without enumerating them.
 
 Read the table below for what it is: a catalog, not a test report. It is hand-maintained against
 `crates/sbproxy-ai/data/ai_providers.yml`, and it records what each entry says about a provider,
@@ -94,25 +94,25 @@ Each provider has a default base URL and auth format. Override `base_url` if you
 
 The `cloudflare`, `vertex`, `runpod`, `azure_foundry`, and `snowflake` defaults contain path template parameters (`{account_id}`, `{location}`, `{project_id}`, `{endpoint_id}`, `{resource}`, `{account}`). Fill them in by overriding `base_url` per-origin, typically with environment-or-config interpolation (for example `base_url: https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`). Paths left with literal placeholders will reach the upstream as-is and 404.
 
-[^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. SBproxy forwards the configured `api_key` verbatim as the bearer token.
+[^vertex-oauth]: Vertex AI requires a short-lived OAuth2 access token rather than a static API key. Generate one with `gcloud auth print-access-token` (or your service account flow) and rotate it before expiry. sbproxy forwards the configured `api_key` verbatim as the bearer token.
 
 [^embed-only]: Voyage and Jina expose embeddings (and rerank) endpoints only. Their catalog entries record that as `supports_chat: false`, which keeps `chat_completions` off their model listings: `GET /v1/models` shows `["embeddings"]` and nothing else. It is not a gate, though. A chat-completions request against one of them is still forwarded and 404s at the upstream, so keep chat traffic away by leaving chat models out of their `models` list, or with `allowed_models`. Mixedbread used to sit in this group and no longer does: its current API reference documents OpenAI-shaped `/v1/chat/completions`, so refusing chat there had become a false refusal.
 
 [^tgi]: Hugging Face archived the TGI repository on 2026-03-21 and put it in maintenance mode, pointing new deployments at vLLM, SGLang, or `llama.cpp`. The entry stays because an existing TGI server keeps serving on this base; the port matches the published Docker quickstart's host mapping rather than the binary's own default.
 
-[^oci]: Oracle Cloud authenticates with a signed `Authorization` header (`Signature version="1",keyId=...`), not a bearer token. As with SigV4, SBproxy does not compute the signature: the request must arrive already signed and the header is forwarded verbatim, so the catalog entry prepends no prefix.
+[^oci]: Oracle Cloud authenticates with a signed `Authorization` header (`Signature version="1",keyId=...`), not a bearer token. As with SigV4, sbproxy does not compute the signature: the request must arrive already signed and the header is forwarded verbatim, so the catalog entry prepends no prefix.
 
 [^writer]: Writer's published OpenAPI puts chat at `/v1/chat` and contains no `chat/completions` path at all, so an OpenAI-shaped request would 404. The entry is `Custom` for that reason: clients must send Writer's own path and body shape.
 
 [^regional]: These vendors run separate domestic and international platforms with distinct accounts and billing. The catalog default is the international endpoint, because that is the one an operator outside the vendor's home market can sign up for. The domestic hosts (`api.moonshot.cn`, `dashscope.aliyuncs.com`, `open.bigmodel.cn`, `api.minimaxi.com`, and BytePlus ModelArk for Volcengine) are a per-origin `base_url` override away.
 
-`format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, SBproxy rewrites the body and path on the way out, and SBproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
+`format` is the wire protocol the upstream expects. OpenAI-compatible upstreams pass through unchanged. Anthropic, Google Gemini, and AWS Bedrock are translated bidirectionally for chat-completions requests: clients send OpenAI-shaped bodies, sbproxy rewrites the body and path on the way out, and sbproxy rewrites the response back to OpenAI shape. For streaming, the relay parses native Anthropic, Gemini, and Bedrock stream frames into the internal hub stream and re-emits OpenAI Chat, Anthropic Messages, or OpenAI Responses shape based on the inbound route. Gemini embeddings at `/v1/embeddings` translate to and from Gemini embedding calls. Oracle OCI, Watsonx, SageMaker, and other `Custom` formats remain native pass-through, so clients must send the provider's native body shape or route through OpenRouter/custom translation.
 
 Override `base_url` to use a region other than us-south for watsonx. Bedrock and SageMaker take their region from `aws_sigv4.region`, which fills the `{region}` placeholder in the default URL; set `base_url` as well only when the endpoint itself moves, as it does for a VPC endpoint.
 
-[^sigv4]: Bedrock and SageMaker do not accept a bearer token. Add `aws_sigv4:` to the provider entry and SBproxy computes the signature for each request. An entry without that block still forwards `api_key` verbatim as the `Authorization` header, which is what you want when a signing sidecar already sits in front of the endpoint. See [AWS SigV4 signing for Bedrock and SageMaker](#aws-sigv4-signing-for-bedrock-and-sagemaker).
+[^sigv4]: Bedrock and SageMaker do not accept a bearer token. Add `aws_sigv4:` to the provider entry and sbproxy computes the signature for each request. An entry without that block still forwards `api_key` verbatim as the `Authorization` header, which is what you want when a signing sidecar already sits in front of the endpoint. See [AWS SigV4 signing for Bedrock and SageMaker](#aws-sigv4-signing-for-bedrock-and-sagemaker).
 
-[^ollama]: Ollama allows blank API keys; SBproxy forwards an empty Bearer token if `api_key` is unset.
+[^ollama]: Ollama allows blank API keys; sbproxy forwards an empty Bearer token if `api_key` is unset.
 
 ## Declared data-handling posture
 
@@ -197,7 +197,7 @@ providers:
 
 ### AWS SigV4 signing for Bedrock and SageMaker
 
-Bedrock and SageMaker reject a bearer token. Each request needs an `Authorization: AWS4-HMAC-SHA256 ...` header computed over a canonical form of that exact request, body hash included. Add `aws_sigv4:` and SBproxy computes it per request:
+Bedrock and SageMaker reject a bearer token. Each request needs an `Authorization: AWS4-HMAC-SHA256 ...` header computed over a canonical form of that exact request, body hash included. Add `aws_sigv4:` and sbproxy computes it per request:
 
 ```yaml
 providers:
@@ -231,11 +231,11 @@ With `base_url` unset, `region` fills the `{region}` placeholder in the catalog 
 |---|---|---|
 | `default_chain` | `AWS_ACCESS_KEY_ID` and the other standard environment variables, the shared config and credentials files, the EKS web identity token, the ECS task role, the EC2 instance profile | Anything running inside AWS. The chain renews short-lived credentials itself. |
 | `static` | `access_key_id`, `secret_access_key`, optional `session_token` | An IAM user key held outside AWS. |
-| `assume_role` | `role_arn`, optional `external_id`, `session_name`, `session_duration_secs` | Cross-account access, and any deployment that wants short-lived credentials SBproxy renews. The base identity comes from the default chain. |
+| `assume_role` | `role_arn`, optional `external_id`, `session_name`, `session_duration_secs` | Cross-account access, and any deployment that wants short-lived credentials sbproxy renews. The base identity comes from the default chain. |
 
-`secret_access_key`, `session_token`, and `external_id` are secret-resolving fields: `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are all dereferenced at config load, and a reference that cannot be resolved is a hard error rather than a value that reaches AWS verbatim. Once resolved they are held in a type whose `Debug` prints `[REDACTED]` and whose bytes are zeroed on drop, and no SBproxy code path formats them into a log line, an error string, or a metric label.
+`secret_access_key`, `session_token`, and `external_id` are secret-resolving fields: `${VAR}`, `vault://`, `awssm://`, `secret://`, and `file:` are all dereferenced at config load, and a reference that cannot be resolved is a hard error rather than a value that reaches AWS verbatim. Once resolved they are held in a type whose `Debug` prints `[REDACTED]` and whose bytes are zeroed on drop, and no sbproxy code path formats them into a log line, an error string, or a metric label.
 
-Prefer a reference over an inlined literal, for `external_id` especially. The admin config endpoints run a redaction pass over the raw config text before returning it, and that pass keys off a fixed list of credential field names. `secret_access_key` and `session_token` are covered; `external_id` is not, because the same field name carries a non-secret payment identifier elsewhere in SBproxy and masking it there would hide reconciliation IDs. A reference sidesteps the question: the file holds `vault://...`, which the redactor deliberately preserves and which is not a secret.
+Prefer a reference over an inlined literal, for `external_id` especially. The admin config endpoints run a redaction pass over the raw config text before returning it, and that pass keys off a fixed list of credential field names. `secret_access_key` and `session_token` are covered; `external_id` is not, because the same field name carries a non-secret payment identifier elsewhere in sbproxy and masking it there would hide reconciliation IDs. A reference sidesteps the question: the file holds `vault://...`, which the redactor deliberately preserves and which is not a secret.
 
 `profile` names a profile in the shared AWS config files and applies to `default_chain` and to the identity `assume_role` starts from.
 
@@ -255,9 +255,9 @@ providers:
 
 An `assume_role` session is renewed 900 seconds before it expires. If STS is unreachable at that moment, the request still goes out on the cached credential and the refresh is retried on the next one, with a WARN naming the failure. Only inside the last 600 seconds does a failed refresh fail the request. Both windows are botocore's, from `RefreshableCredentials`. `refresh_margin_secs` moves the first one and has to stay at or above 600; leave it above 600 if you want the overlap that makes a failed refresh survivable.
 
-A `static` block carrying a `session_token` is the one credential SBproxy cannot renew, because a session token arrives already issued and there is nothing to reissue it from. Once it lapses, Bedrock answers 403 `ExpiredTokenException` until the config supplies a new one. Use `assume_role` or `default_chain` when you want the renewal handled.
+A `static` block carrying a `session_token` is the one credential sbproxy cannot renew, because a session token arrives already issued and there is nothing to reissue it from. Once it lapses, Bedrock answers 403 `ExpiredTokenException` until the config supplies a new one. Use `assume_role` or `default_chain` when you want the renewal handled.
 
-Clock skew is the other way a correct key produces a 403. AWS refuses a signature whose timestamp sits too far from its own clock, and Bedrock reports that as a plain 403 that looks much like a permissions error. SBproxy reads the `Date` header off the rejection, estimates the local offset against the round trip's midpoint, and once the offset passes four minutes it logs a WARN naming clock skew and applies the correction to later signatures. Traffic recovers on its own; the log line is your cue to fix NTP on that host, since a correction is not a repair. A wrong secret key never moves the measured offset, which is what tells the two apart in the log.
+Clock skew is the other way a correct key produces a 403. AWS refuses a signature whose timestamp sits too far from its own clock, and Bedrock reports that as a plain 403 that looks much like a permissions error. sbproxy reads the `Date` header off the rejection, estimates the local offset against the round trip's midpoint, and once the offset passes four minutes it logs a WARN naming clock skew and applies the correction to later signatures. Traffic recovers on its own; the log line is your cue to fix NTP on that host, since a correction is not a repair. A wrong secret key never moves the measured offset, which is what tells the two apart in the log.
 
 #### What signing does not cover
 

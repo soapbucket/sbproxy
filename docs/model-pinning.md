@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-29*
 
-SBproxy keeps its trusted classifier registry in
+sbproxy keeps its trusted classifier registry in
 `crates/sbproxy-classifiers/src/known_models.rs`. Every merged entry
 identifies an immutable upstream artifact pair and carries both SHA-256
 digests. Detectors can reference an entry by name instead of repeating
@@ -79,7 +79,7 @@ directory. The bytes then became a tensor the graph could route to an
 output. That is GHSA-h668-6x6g-f8r5, and it is a read of any file the
 proxy user can open.
 
-SBproxy refuses external tensor data outright. A model this process loads
+sbproxy refuses external tensor data outright. A model this process loads
 holds its own tensors, and one that does not is refused before any file is
 opened:
 

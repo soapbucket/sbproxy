@@ -760,7 +760,7 @@ reference when this node should follow verified releases automatically. Set
 through 86400 for timed refresh. Multiple Git sources refresh together at the
 shortest enabled interval.
 
-The credential must be a secret reference. SBproxy resolves it through the
+The credential must be a secret reference. sbproxy resolves it through the
 configured process secret backend and keeps the value out of the remote URL,
 Git arguments, checkout metadata, logs, errors, and inventory. Configure SSH
 keys on the host when `repo` uses an SSH transport.

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-26*
 
-SBproxy's AI toolkit runs bounded, finite-state workflows against an
+sbproxy's AI toolkit runs bounded, finite-state workflows against an
 operator-declared agent registry. Agents, workflows, schemas, limits, secrets,
 and the egress allowlist are compiled into one immutable pipeline generation.
 Operators discover and invoke that generation through the authenticated admin
@@ -85,7 +85,7 @@ origins:
 
 `auth.shared_secret` must be a secret reference such as
 `env:SB_AGENT_SECRET`; inline secret material is a compile error. The reference
-is resolved only while SBproxy constructs a candidate runtime and the resolved
+is resolved only while sbproxy constructs a candidate runtime and the resolved
 value is not retained in the parsed configuration, logs, snapshots, or events.
 
 Agent calls require a top-level `egress.agent_orchestration` block with

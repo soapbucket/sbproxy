@@ -14,7 +14,7 @@ additional plumbing.
 
 ## Default behavior
 
-Off. SBproxy emits no access-log lines unless the top-level `access_log`
+Off. sbproxy emits no access-log lines unless the top-level `access_log`
 block is present and `enabled: true`. Metrics, traces, and the audit log
 are unaffected by this knob.
 
@@ -539,13 +539,13 @@ access_log:
     compress: true
 ```
 
-When the active file reaches `max_size_mb`, SBproxy rotates it before
+When the active file reaches `max_size_mb`, sbproxy rotates it before
 writing the next line. Rotated files use suffixes like
 `access.log.1` or `access.log.1.gz`; `max_backups` caps how many
 rotated files are retained. `compress: true` gzips rotated files.
 
 The active file and every rotated copy are created owner-only
-(`0600`), and a directory SBproxy creates for them is `0700`. An
+(`0600`), and a directory sbproxy creates for them is `0700`. An
 access-log line carries the path, the identity, and the decision for
 one request, which is a record an operator asked to keep rather than
 to publish. A file that is already on disk at a wider mode is

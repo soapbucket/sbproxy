@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-SBproxy evaluates standard [Rego](https://www.openpolicyagent.org/docs/policy-language) through [Regorus](https://github.com/microsoft/regorus), Microsoft's Rust interpreter, in the same process as the request pipeline. If you already write Rego for OPA, the policy body is portable: paste the module in, and it runs against the same request context a CEL policy sees. There is no OPA server to run alongside the proxy, no bundle endpoint to poll, and no REST decision API. Regorus is a Rego evaluator, not an OPA deployment, and this page only covers what that evaluator does inside SBproxy.
+sbproxy evaluates standard [Rego](https://www.openpolicyagent.org/docs/policy-language) through [Regorus](https://github.com/microsoft/regorus), Microsoft's Rust interpreter, in the same process as the request pipeline. If you already write Rego for OPA, the policy body is portable: paste the module in, and it runs against the same request context a CEL policy sees. There is no OPA server to run alongside the proxy, no bundle endpoint to poll, and no REST decision API. Regorus is a Rego evaluator, not an OPA deployment, and this page only covers what that evaluator does inside sbproxy.
 
 ## Where Rego runs
 
@@ -125,7 +125,7 @@ One more divergence from upstream OPA is worth knowing before porting a policy: 
 
 ## Operational model: config-wide, not bundle-scoped
 
-OPA activates a downloaded policy bundle only after verifying it, and keeps serving the previous bundle if activation fails. SBproxy's hot reload works the same way at the scale of the whole config: a Rego module that fails to parse, or one whose query names no rule, refuses the reload outright, and the previously active config keeps serving traffic. Both faults are caught before the first request, because the compiler runs one trial evaluation against an empty input at load time rather than deferring that check to whenever the module happens to see live traffic. See [extension-bundles.md's comparison to OPA bundle management](extension-bundles.md#context-from-other-extension-systems) for where SBproxy draws that analogy explicitly for its own bundle registry; the same last-good posture applies here, one config generation at a time rather than one bundle at a time.
+OPA activates a downloaded policy bundle only after verifying it, and keeps serving the previous bundle if activation fails. sbproxy's hot reload works the same way at the scale of the whole config: a Rego module that fails to parse, or one whose query names no rule, refuses the reload outright, and the previously active config keeps serving traffic. Both faults are caught before the first request, because the compiler runs one trial evaluation against an empty input at load time rather than deferring that check to whenever the module happens to see live traffic. See [extension-bundles.md's comparison to OPA bundle management](extension-bundles.md#context-from-other-extension-systems) for where sbproxy draws that analogy explicitly for its own bundle registry; the same last-good posture applies here, one config generation at a time rather than one bundle at a time.
 
 ## Rego beyond policies
 

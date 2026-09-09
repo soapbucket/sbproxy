@@ -2,11 +2,11 @@
 
 *Last modified: 2026-08-21*
 
-Quick answers to the questions operators hit most often when standing up SBproxy, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
+Quick answers to the questions operators hit most often when standing up sbproxy, debugging a config that will not load, or wiring observability. For the full reference of any feature, follow the link to the matching doc.
 
 ## Install + first run
 
-### How do I install SBproxy?
+### How do I install sbproxy?
 
 Pick whichever fits your platform:
 
@@ -23,7 +23,7 @@ docker pull soapbucket/sbproxy:latest
 
 See [manual.md](./manual.md) for systemd unit files, the Kubernetes manifest, and the Helm chart.
 
-### How do I run SBproxy against my own config?
+### How do I run sbproxy against my own config?
 
 ```bash
 sbproxy serve --config sb.yml
@@ -60,9 +60,9 @@ Everything in this repository ships under Apache-2.0:
 * The embedded admin server, the access log, the metrics and tracing wiring, the audit log.
 * All examples and dashboards.
 
-### Can I run SBproxy in production?
+### Can I run sbproxy in production?
 
-Yes. SBproxy is licensed under the Apache License 2.0, which permits any use, including production and commercial deployment, with no field-of-use restriction.
+Yes. sbproxy is licensed under the Apache License 2.0, which permits any use, including production and commercial deployment, with no field-of-use restriction.
 
 ## Auth + sessions
 
@@ -70,8 +70,8 @@ Yes. SBproxy is licensed under the Apache License 2.0, which permits any use, in
 
 The most common causes, in order:
 
-1. The auth provider was never matched on the request's `Host`. SBproxy routes by `Host` first; an auth block on `api.example.com` does not apply to a request with `Host: api.test`. Check `sbproxy_auth_results_total{origin}` in metrics to confirm.
-2. Trusted-proxy CIDRs are wrong. If SBproxy sits behind another LB,
+1. The auth provider was never matched on the request's `Host`. sbproxy routes by `Host` first; an auth block on `api.example.com` does not apply to a request with `Host: api.test`. Check `sbproxy_auth_results_total{origin}` in metrics to confirm.
+2. Trusted-proxy CIDRs are wrong. If sbproxy sits behind another LB,
    `X-Forwarded-For` headers from outside `proxy.trusted_proxies` are stripped
    on ingress and the real client IP is the LB. This affects only policies and
    authentication that use the client address, such as IP filtering or an
@@ -151,11 +151,11 @@ OTLP exporter, configured via `proxy.observability.telemetry.endpoint` in `sb.ym
 
 ## Performance + capacity
 
-### What overhead does SBproxy add per request?
+### What overhead does sbproxy add per request?
 
 Sub-millisecond p99 at 50k+ rps on commodity hardware for plain proxy paths; AI gateway paths add ~3-5ms for the routing decision and guardrail check, dominated by upstream latency. The `ai-lb-benchmark.md` page has measured P50/P95/P99/P99.9 across every router strategy under skewed load.
 
-### How do I tune SBproxy for high concurrency?
+### How do I tune sbproxy for high concurrency?
 
 `performance.md` has the operator-facing tuning guide. The two settings that move the needle: the `SB_WORKER_THREADS` environment variable (defaults to the detected CPU parallelism, which honors cgroup quotas on Linux) and the connection pool sizes per upstream.
 
@@ -168,7 +168,7 @@ closest to your scenario, copy its `sb.yml`, and edit from there. The
 configuration examples are checked in CI, and their READMEs carry the commands
 needed to exercise each feature.
 
-### How do I run an example against my local SBproxy?
+### How do I run an example against my local sbproxy?
 
 ```bash
 make run CONFIG=examples/basic-proxy/sb.yml

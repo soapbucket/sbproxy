@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-28*
 
-SBproxy is a reverse proxy that also governs the AI coming *in*: crawlers and agents hitting your APIs and content. Two jobs show up together in production and are documented as separate walkthroughs today. This page stitches them.
+sbproxy is a reverse proxy that also governs the AI coming *in*: crawlers and agents hitting your APIs and content. Two jobs show up together in production and are documented as separate walkthroughs today. This page stitches them.
 
 ## What you will build
 
@@ -16,7 +16,7 @@ You can run either half alone. Running both is the inbound estate.
 Do these in order if you are new to inbound traffic. Each page installs the binary, writes a config, and has a `curl` you can copy.
 
 1. **Shape the body.** [getting-started-content-estate.md](getting-started-content-estate.md) fronts `test.sbproxy.dev/html`, converts the page to Markdown, and stamps the Markdown content type. Runnable twin: [`examples/transform-html-to-markdown/`](../examples/transform-html-to-markdown/). When you later charge crawlers or negotiate `text/markdown` vs HTML per request, start from [content-for-agents.md](content-for-agents.md) and [use-case-meter-crawlers.md](use-case-meter-crawlers.md).
-2. **Verify the caller.** [getting-started-agent-identity.md](getting-started-agent-identity.md) checks Ed25519 HTTP Message Signatures against a directory of known agent keys, and shows how to publish a key directory for an SBproxy signing identity. Runnable twin: [`examples/web-bot-auth/`](../examples/web-bot-auth/).
+2. **Verify the caller.** [getting-started-agent-identity.md](getting-started-agent-identity.md) checks Ed25519 HTTP Message Signatures against a directory of known agent keys, and shows how to publish a key directory for an sbproxy signing identity. Runnable twin: [`examples/web-bot-auth/`](../examples/web-bot-auth/).
 
 The two jobs do not share a config in this stitch on purpose. `bot_auth` verifies callers. Transforms reshape bodies. Putting them on one origin is a later composition (auth first, then the content transform), not a missing file.
 

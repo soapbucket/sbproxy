@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-19*
 
-This is the cookbook for expressing a specific license stance via SBproxy YAML and seeing the result in the `/licenses.xml` document the proxy serves. The reader is a publisher author or counsel who wants the right RSL terms on the wire without writing XML by hand.
+This is the cookbook for expressing a specific license stance via sbproxy YAML and seeing the result in the `/licenses.xml` document the proxy serves. The reader is a publisher author or counsel who wants the right RSL terms on the wire without writing XML by hand.
 
 If you have not yet wired `ai_crawl_control` on the origin, read [ai-crawl-control.md](ai-crawl-control.md) first. If you want the broader picture (content negotiation, JSON envelope, the projections, transforms), read [content-for-agents.md](content-for-agents.md).
 
@@ -14,7 +14,7 @@ The Really Simple Licensing 1.0 specification (RSL Collective, https://rslstanda
 - **`ai-input`.** Whether the content may be used as model input at inference time, e.g. as RAG context or as a tool-use payload.
 - **`search`.** Whether the content may be indexed for a non-LLM search engine. Often free or nominally priced.
 
-Permitted tokens appear inside a `<permits type="usage">` element; prohibited tokens appear inside a `<prohibits type="usage">` element. A token that is neither permitted nor prohibited is simply absent, which the spec treats as silence: the document takes no position on that use. SBproxy maps operator YAML onto this vocabulary directly, so the config is the source of truth for the served `/licenses.xml`.
+Permitted tokens appear inside a `<permits type="usage">` element; prohibited tokens appear inside a `<prohibits type="usage">` element. A token that is neither permitted nor prohibited is simply absent, which the spec treats as silence: the document takes no position on that use. sbproxy maps operator YAML onto this vocabulary directly, so the config is the source of truth for the served `/licenses.xml`.
 
 RSL is cooperative, not enforceable on its own. A motivated agent that ignores the document still gets a 402 challenge from the proxy if it tries to access a priced route. RSL exists so cooperative agents (the ones that pay) and licensing counterparties have a stable, machine-readable artifact to reference.
 
@@ -31,7 +31,7 @@ The proxy translates the origin-level signal into the matching `<permits>` asser
 | `search` | `<permits type="usage">search</permits>` |
 | absent | no `<permits>` or `<prohibits>` element (the document is silent on usage) |
 
-The "absent" row follows the spec: when no usage token is declared, the document simply says nothing about usage. SBproxy does not synthesize a default-deny element (RSL 1.0 has no element for that; an earlier `<ai-use licensed="false">` emission was non-conformant and has been removed). To reserve rights when no signal is declared, the proxy stamps a `TDM-Reservation: 1` response header instead, and the `/.well-known/tdmrep.json` projection serves an empty array.
+The "absent" row follows the spec: when no usage token is declared, the document simply says nothing about usage. sbproxy does not synthesize a default-deny element (RSL 1.0 has no element for that; an earlier `<ai-use licensed="false">` emission was non-conformant and has been removed). To reserve rights when no signal is declared, the proxy stamps a `TDM-Reservation: 1` response header instead, and the `/.well-known/tdmrep.json` projection serves an empty array.
 
 To express an explicit prohibition in the document body (a `<prohibits>` element), use the plural `content_signals:` block on the `ai_crawl_control` policy; see Recipe 4.
 
@@ -89,7 +89,7 @@ origins:
 </rsl>
 ```
 
-The `<payment>` element reflects the policy-level `price:` / `currency:` (a positive price maps to `type="crawl"`; no price maps to `type="free"`). The `<content-signal>` element is an SBproxy extension that echoes the operator's declared signal verbatim for the audit trail; spec-aware consumers ignore unknown elements.
+The `<payment>` element reflects the policy-level `price:` / `currency:` (a positive price maps to `type="crawl"`; no price maps to `type="free"`). The `<content-signal>` element is an sbproxy extension that echoes the operator's declared signal verbatim for the audit trail; spec-aware consumers ignore unknown elements.
 
 The `citation_required: true` flag does not appear in the RSL document. It propagates to the JSON envelope (`citation_required: true`) and to the `citation_block` transform, which prepends a one-line `> Citation required ... Source: ... License: ...` blockquote to Markdown bodies. RSL captures the licensing posture; the citation requirement rides on the response body and the per-tier `citation_required` field.
 
@@ -232,7 +232,7 @@ Note that the license scope is per-origin: the document carries a single `<conte
 
 ## URN format
 
-The RSL URN format SBproxy emits is:
+The RSL URN format sbproxy emits is:
 
 ```
 urn:rsl:1.0:<origin_hostname>:<config_version>
@@ -330,7 +330,7 @@ Crawl-delay: 1
 
 The prices differ per path because the example prices `/docs/*` at a
 different tier, and they render at six decimal places, matching the 402
-challenge body rather than the config's `0.001`. The `SBproxy-AI-Extension`
+challenge body rather than the config's `0.001`. The `sbproxy-AI-Extension`
 lines are comments: a crawler that does not understand them still reads the
 standard `Disallow` and `Crawl-delay` directives correctly.
 
@@ -524,7 +524,7 @@ xmllint --noout licenses.xml
 
 The wire format follows the prose spec at https://rslstandard.org/rsl. The emitter tests in `crates/sbproxy-modules/src/projections/licenses.rs` pin the document shape: the root namespace, the nested `<rsl><content url="..."><license>...</license></content></rsl>` envelope, the `<permits type="usage">` / `<prohibits type="usage">` mapping, and a regression guard that no legacy `<ai-use>` element is ever emitted. Any emitter change that drifts from this shape fails the CI gate.
 
-If the served document does not match what is documented here, open an issue against the SBproxy repo with the served body attached.
+If the served document does not match what is documented here, open an issue against the sbproxy repo with the served body attached.
 
 ## Companion documents
 

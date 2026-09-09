@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-16*
 
-This guide is the operator-facing companion to the content-shaping pillar. If you have SBproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-origin editorial signal that ties everything together.
+This guide is the operator-facing companion to the content-shaping pillar. If you have sbproxy running and you have already read [configuration.md](configuration.md) and [ai-crawl-control.md](ai-crawl-control.md), this is the next document. It covers how the proxy negotiates a content shape with an agent, how the body is transformed into that shape, what license posture the proxy advertises in four well-known documents, and how operators stamp the per-origin editorial signal that ties everything together.
 
 The reader is a publisher or platform engineer who wants to turn on agent-aware content delivery. The audience is not Rust developers; the focus is configuration, wire shapes, and the operational guarantees you get for them.
 
@@ -195,7 +195,7 @@ Crawl-delay: 1
 # SBproxy-AI-Extension: pay-per-crawl price=0.005000 currency=USD shape=any
 ```
 
-One `User-agent:` stanza per agent class with at least one priced tier, plus a wildcard stanza for the policy-level fallback price. The `# SBproxy-AI-Extension:` comment lines carry pricing metadata for cooperative crawlers; the prefix is intentionally non-standard pending IETF standardisation. Agent classes resolve from `tiers[].agent_id` selectors; `*` is the wildcard. The `# Config version:` stamp is the proxy's reload counter, rendered in decimal (the `projections render` CLI always prints `0`).
+One `User-agent:` stanza per agent class with at least one priced tier, plus a wildcard stanza for the policy-level fallback price. The `# sbproxy-AI-Extension:` comment lines carry pricing metadata for cooperative crawlers; the prefix is intentionally non-standard pending IETF standardisation. Agent classes resolve from `tiers[].agent_id` selectors; `*` is the wildcard. The `# Config version:` stamp is the proxy's reload counter, rendered in decimal (the `projections render` CLI always prints `0`).
 
 ### `llms.txt` and `llms-full.txt`
 
@@ -464,7 +464,7 @@ origins:
               currency: USD
 ```
 
-`/licenses.xml` carries no `<permits>` or `<prohibits>` element at all: with no signal declared, the document is silent on usage (SBproxy emits no default-deny element because RSL 1.0 has none). `/.well-known/tdmrep.json` emits an empty array `[]`, and the response middleware stamps `TDM-Reservation: 1` on every response so the right is reserved at the header layer. The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
+`/licenses.xml` carries no `<permits>` or `<prohibits>` element at all: with no signal declared, the document is silent on usage (sbproxy emits no default-deny element because RSL 1.0 has none). `/.well-known/tdmrep.json` emits an empty array `[]`, and the response middleware stamps `TDM-Reservation: 1` on every response so the right is reserved at the header layer. The high tier price on `/*` produces a 402 challenge with a price the operator does not actually expect to be paid; the policy is effectively a paywall on every AI-class request.
 
 This is the recommended posture for content the operator does not want any AI use of.
 
@@ -498,13 +498,13 @@ Run `sbproxy projections render --kind licenses --config ./sb.yml` after making 
 
 ## aipref signals
 
-The `aipref:` request header expresses an opt-out preference at the resource level per draft-ietf-aipref-prefs. SBproxy parses it on inbound requests and surfaces the result to the scripting layer.
+The `aipref:` request header expresses an opt-out preference at the resource level per draft-ietf-aipref-prefs. sbproxy parses it on inbound requests and surfaces the result to the scripting layer.
 
 ```text
 aipref: train=no, search=yes, ai-input=yes
 ```
 
-The header is a comma-separated list of `key=value` pairs. SBproxy recognizes three keys: `train`, `search`, `ai-input`. Values are `yes` or `no`; unknown values default to `yes` (permissive).
+The header is a comma-separated list of `key=value` pairs. sbproxy recognizes three keys: `train`, `search`, `ai-input`. Values are `yes` or `no`; unknown values default to `yes` (permissive).
 
 ### Default-permissive
 

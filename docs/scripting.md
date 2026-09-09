@@ -1,12 +1,12 @@
-# SBproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
+# sbproxy scripting reference: CEL, Rego, Lua, JavaScript, and WASM
 
 *Last modified: 2026-09-05*
 
-SBproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. The available request context depends on the configuration field; a WASM body transform receives it only with `request_context: true`.
+sbproxy includes five scripting engines for custom logic: CEL (Common Expression Language), Rego (via Regorus), Lua, JavaScript, and WASM. The available request context depends on the configuration field; a WASM body transform receives it only with `request_context: true`.
 
 | Engine | Implementation | Best for |
 |--------|----------------|----------|
-| CEL | `cel-rust` (the `cel` crate), with custom SBproxy functions | Policy gates, routing keys, response header rules |
+| CEL | `cel-rust` (the `cel` crate), with custom sbproxy functions | Policy gates, routing keys, response header rules |
 | Rego | Regorus (Microsoft's Rust interpreter), in process | Policy gates you already have written for OPA |
 | Lua | `mlua` running the Luau runtime, sandboxed | Header modifiers, JSON body rewriting, WAF custom rules |
 | JavaScript | `rquickjs` (QuickJS), sandboxed with JSON helpers | JS-native body transforms and response modifiers |
@@ -287,7 +287,7 @@ Caused by:
 
 ### 3.3 Built-in functions
 
-CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`) and the `cel` crate's stock helpers such as `contains`, `startsWith`, `endsWith`, and `size`. SBproxy registers these additional functions on every evaluation context:
+CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`) and the `cel` crate's stock helpers such as `contains`, `startsWith`, `endsWith`, and `size`. sbproxy registers these additional functions on every evaluation context:
 
 | Function | Returns | Description |
 |---|---|---|
@@ -627,7 +627,7 @@ What still loads is a sibling: an object at `data.sbproxy` holding keys no rule 
 
 **Typos are not caught at config load.** A CEL expression naming a binding its surface does not provide is refused when the config loads. Rego cannot offer that: `input.request.trust_teir` is not an error, it is `undefined`, which is a value the language is designed to reason about. A misspelled binding is a rule that never fires, discovered from traffic behavior rather than from an error message. This is the strongest reason to prefer `expression` when either engine would do.
 
-**The SBproxy helper functions do not exist in Rego.** `flag_enabled()` and `tls_fingerprint_matches()` have no Rego equivalent; a policy needing either belongs in `expression`. The generic helpers have standard Rego analogs: `ip_in_cidr` is `net.cidr_contains`, `sha256` is `crypto.sha256`, `regex_match` is `regex.match`.
+**The sbproxy helper functions do not exist in Rego.** `flag_enabled()` and `tls_fingerprint_matches()` have no Rego equivalent; a policy needing either belongs in `expression`. The generic helpers have standard Rego analogs: `ip_in_cidr` is `net.cidr_contains`, `sha256` is `crypto.sha256`, `regex_match` is `regex.match`.
 
 ### Failure posture
 
@@ -1496,7 +1496,7 @@ AI policy CEL is a different namespace. The `ai_policy` expression sees `ai.*` v
 
 ## 12. Dynamic extension bundles
 
-For packaging and distributing JavaScript, TypeScript, and WASM behaviors as reusable components, SBproxy supports Extension Bundles. 
+For packaging and distributing JavaScript, TypeScript, and WASM behaviors as reusable components, sbproxy supports Extension Bundles. 
 
 For full details on the extension architecture, candidate loading, and manifest reference, see the dedicated [Extension bundles](extension-bundles.md) guide.
 

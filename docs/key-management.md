@@ -1,4 +1,4 @@
-# SBproxy dynamic key management
+# sbproxy dynamic key management
 
 *Last modified: 2026-08-29*
 
@@ -81,14 +81,14 @@ A bind mount to a host directory works too.
 A minted key is presented in whatever header the calling tool already sends.
 An Anthropic SDK sends `x-api-key`, Azure OpenAI sends `api-key`, and an
 internal tool sends whatever its author picked. Rather than ask you to rewrite
-those tools, SBproxy sweeps a configured list of headers for a token.
+those tools, sbproxy sweeps a configured list of headers for a token.
 
 The list is route-level, not per-key, and it has to be: to know which header
 holds the key you would have to have resolved the key already. The default
 covers the three common shapes and you can add your own.
 
 A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
-fixed alphabet. SBproxy recognizes that shape before store access, then looks
+fixed alphabet. sbproxy recognizes that shape before store access, then looks
 up the public key id and verifies the secret. Shape recognition alone never
 authenticates a request. A caller presenting their own `sk-proj-...` or
 `sk-ant-...` provider key enters the native-key policy described below and,
@@ -104,7 +104,7 @@ credential upstream.
 
 ### Two ways to use it
 
-**Substitution.** The tool already sends `x-api-key`. Point it at SBproxy,
+**Substitution.** The tool already sends `x-api-key`. Point it at sbproxy,
 give it a minted key instead of the provider key, and bind that key to a stored
 credential. The upstream sees its own real key in `x-api-key`; the tool never
 holds it.
@@ -115,7 +115,7 @@ upstream <- x-api-key: <the real provider key>  (from the bound credential)
 ```
 
 **Sidecar.** The tool keeps sending its own credential, and the minted key
-rides alongside in `x-sb-api`. SBproxy governs the request without storing or
+rides alongside in `x-sb-api`. sbproxy governs the request without storing or
 managing the caller-owned upstream secret; it still receives and forwards that
 secret on the proxied request.
 
@@ -137,7 +137,7 @@ is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
-Primary credential carriers are security-sensitive protocol fields, so SBproxy
+Primary credential carriers are security-sensitive protocol fields, so sbproxy
 validates them even when `key_management.enabled` is currently `false`.
 Carriers cannot reuse hop-by-hop, framing, WebSocket, tracing, signature,
 correlation, budget identity, A2A envelope, access-log identity, or
@@ -150,7 +150,7 @@ header.
 
 Recognized native credentials require an explicit
 `inbound.native_key_policy.allowed_providers` allowlist. If the policy is
-absent or the recognized provider is not listed, SBproxy returns 403 before
+absent or the recognized provider is not listed, sbproxy returns 403 before
 dispatch. A credential matching no hint remains unattributed and follows the
 origin's ordinary auth behavior.
 
@@ -195,7 +195,7 @@ policy identity is built from those labels and contains no credential bytes.
 On a generic proxy route, an allowed caller-owned credential passes upstream
 unchanged, even when that origin also configures `outbound_credential`: native
 mode represents an explicit caller-owned identity, so the origin credential
-must not replace it. SBproxy receives and forwards the caller-owned secret, but
+must not replace it. sbproxy receives and forwards the caller-owned secret, but
 does not store, manage, or substitute it. An AI provider must opt in as an
 exact credential destination. Set `accept_native_credentials_for` to the
 canonical hint label, and make it match the provider's wire type:
@@ -1262,7 +1262,7 @@ accounting are different guarantees; see
   pipeline with `on`, disables compression with `off`, or selects one named
   route-local profile. Header `X-Compression` overrides the governed key, CEL
   is consulted only when the key has no selector, and an absent selector uses
-  the route default. SBproxy strips the request header before upstream
+  the route default. sbproxy strips the request header before upstream
   dispatch. The Admin API validates selector syntax but cannot prove which AI
   origin a dynamic key will reach. A syntactically valid profile that is not
   declared on the eventual route safely resolves to `off` and records
@@ -1299,7 +1299,7 @@ is the intersection of the MCP action's tool allowlist, per-server RBAC,
 version-gate verdict, and the key's optional `inject_mcp.filter`. A reference
 cannot select another tenant's catalogue, and a rejected reload cannot replace
 the source held by an in-flight request. If that governed intersection is
-empty or the tenant-local reference is unknown, SBproxy sends an empty tool
+empty or the tenant-local reference is unknown, sbproxy sends an empty tool
 array; it never falls back to caller-supplied tools.
 
 The tenant is worth checking on an existing config. The reference used to
@@ -2263,4 +2263,4 @@ To see various authentication schemes configured in practice, refer to these run
 | [`auth-bearer-dpop`](../examples/auth-bearer-dpop/) | Bearer tokens with DPoP. | Enforce Demonstrating Proof-of-Possession (DPoP). | Prevents token theft by binding tokens to a client's private key. |
 | [`auth-cap`](../examples/auth-cap/) | CAP Auth. | Use `auth: cap` for capability-based authorization. | Granular, cryptographically secure capability delegation. |
 | [`keys-inbound-headers`](../examples/keys-inbound-headers/) | Key resolution from headers. | Map custom headers (e.g. `X-My-Key`) to auth principals. | Flexible integrations with existing client code. |
-| [`sessions`](../examples/sessions/) | Stateful browser sessions. | Manage secure HTTP-only cookies and CSRF. | Full lifecycle management for web applications behind SBproxy. |
+| [`sessions`](../examples/sessions/) | Stateful browser sessions. | Manage secure HTTP-only cookies and CSRF. | Full lifecycle management for web applications behind sbproxy. |

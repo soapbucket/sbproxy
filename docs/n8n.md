@@ -1,12 +1,12 @@
-# n8n with SBproxy
+# n8n with sbproxy
 
 *Last modified: 2026-08-19*
 
-n8n workflows normally talk to model providers directly: you paste an OpenAI key into a credential and every AI Agent run calls `api.openai.com`. Point that credential at an SBproxy you run instead, and every workflow run crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. n8n is configured through its UI rather than code, so this page walks through the fields to fill in and the exact values to type, on both sides of the wire.
+n8n workflows normally talk to model providers directly: you paste an OpenAI key into a credential and every AI Agent run calls `api.openai.com`. Point that credential at an sbproxy you run instead, and every workflow run crosses one gateway you control. That is where virtual keys scope models and attribute spend, budgets meter tokens and dollars, guardrails screen traffic, the usage ledger records what happened, and repeated completions can come back from cache. n8n is configured through its UI rather than code, so this page walks through the fields to fill in and the exact values to type, on both sides of the wire.
 
 ## Chat models through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and n8n's OpenAI credential has a Base URL field. Changing that one field routes the OpenAI Chat Model node, and every AI Agent built on it, through the gateway. You do not need a custom node.
+sbproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, and n8n's OpenAI credential has a Base URL field. Changing that one field routes the OpenAI Chat Model node, and every AI Agent built on it, through the gateway. You do not need a custom node.
 
 The gateway needs an origin with an `ai_proxy` action and a credential for the virtual key. Save this as `sb.yml` and start the gateway with `sbproxy sb.yml`:
 
@@ -65,7 +65,7 @@ A one-line greeting back means the whole path works: key matched, model allowed,
 3. In API Key, enter `sk-your-virtual-key`, exactly the string from the `key:` line in `sb.yml`.
 4. Leave Organization ID empty. It exists for accounts that belong to several OpenAI organizations and means nothing to the gateway.
 5. In Base URL, replace the default `https://api.openai.com/v1` with `http://127.0.0.1:8080/v1`.
-6. Save. n8n tests the credential with a model-list request to the Base URL. SBproxy answers `GET /v1/models` on `ai_proxy` origins, so a passing test proves n8n reached your gateway, not OpenAI.
+6. Save. n8n tests the credential with a model-list request to the Base URL. sbproxy answers `GET /v1/models` on `ai_proxy` origins, so a passing test proves n8n reached your gateway, not OpenAI.
 
 If n8n runs in Docker and the gateway runs on the host, `127.0.0.1` inside the container is the container itself. Use `http://host.docker.internal:8080/v1` as the Base URL and key the origin `"host.docker.internal"` in `sb.yml`.
 
@@ -80,7 +80,7 @@ If n8n runs in Docker and the gateway runs on the host, `127.0.0.1` inside the c
 
 ## MCP tools through the gateway
 
-SBproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
+sbproxy is also a gateway for the Model Context Protocol (MCP), the JSON-RPC protocol agents use to discover and call tools. The gateway aggregates any number of upstream MCP servers behind one endpoint: clients POST JSON-RPC requests such as `tools/list` and `tools/call` to the origin root, and the gateway federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
 
 A minimal `mcp` origin federating two upstream tool servers:
 

@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-27*
 
-SBproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
+sbproxy resolves every secret-bearing config value through one reference grammar, checked by one function. A provider credential under `credentials:`, a `source:` block's `credential` field, the `pepper` and `master_key` under `key_management.crypto`, and the value each provider URI on this page resolves to are all meant to go through that same grammar, in the same order, with the same failure behavior. There is nothing field-specific to learn: a form that works in one secret-bearing field works in all of them.
 
 Three shapes read a value directly (an environment variable, a file, or a value already in hand); a fourth shape is a provider URI that names a configured backend:
 
@@ -20,7 +20,7 @@ A reload whose `proxy.secrets` block differs from the one the process started wi
 
 Earlier versions accepted the reload and silently ignored the change. That was worse than refusing: the new backend never existed, so the first reference to it failed at handler construction with an error that named the reference rather than the real cause, and the reload that introduced it had already reported success. If you are used to that behavior, the refusal is the fix, not a regression.
 
-Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where SBproxy looks that does.
+Everything else in a config still hot-reloads normally. Only the `proxy.secrets` block carries this restriction, and only when it actually changes; reloading an unchanged block is a no-op. The values behind a reference are re-resolved on every reload, so rotating a secret **in** Vault or Secrets Manager needs no restart. It is only changing where sbproxy looks that does.
 
 ## Reference Forms
 
@@ -64,7 +64,7 @@ A provider URI resolves in all but the last case, because it can only reach a ba
 Two older shapes still work, each logging a one-time warning, and neither is what to write in new config:
 
 * **`vault://env/NAME`** resolves `NAME` from the environment, identically to `${NAME}` or `env:NAME`. It predates the provider-specific schemes above; replace it with `${NAME}` or `env:NAME`.
-* **`vault://<alias>/...`** for `alias` in `aws`, `k8s`, `file`, `hashi` rewrites to the matching provider-specific scheme (`awssm://`, `k8ssecret://`, `secretfile://`, `vault://`) with `<alias>` carried over as the backend name. Still accepted with a warning as of SBproxy 1.11.0; the warning names 1.2.0 as the scheduled removal version, but no release has actually removed it yet.
+* **`vault://<alias>/...`** for `alias` in `aws`, `k8s`, `file`, `hashi` rewrites to the matching provider-specific scheme (`awssm://`, `k8ssecret://`, `secretfile://`, `vault://`) with `<alias>` carried over as the backend name. Still accepted with a warning as of sbproxy 1.11.0; the warning names 1.2.0 as the scheduled removal version, but no release has actually removed it yet.
 
 Run this to rewrite known legacy aliases across a config file:
 
@@ -481,7 +481,7 @@ credentials.
 It reaches past the ones a secret backend supplies. The same redaction
 applies to the keys a caller presents inbound (API keys, bearer tokens,
 Basic and Digest passwords, the JWT HMAC secret, and the token the
-inbound sweep lifts out of a request header), to the credentials SBproxy
+inbound sweep lifts out of a request header), to the credentials sbproxy
 presents upstream (an AI provider's API key, an embedding or vector
 store key, an OAuth client secret, a vault-resolved bearer token, a
 usage sink's write key, a Stripe secret key, a Consul ACL token), to the

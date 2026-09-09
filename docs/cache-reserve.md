@@ -3,7 +3,7 @@
 
 Cache Reserve is a long-tail cold tier sitting under the per-origin response cache. Items evicted from the hot cache are admitted into the reserve subject to a sample rate and size threshold; on a hot miss the proxy consults the reserve before falling through to origin and promotes the entry back into the hot tier on hit.
 
-SBproxy ships four reserve backends out of the box: memory, filesystem, redis, and object storage (S3, Google Cloud Storage, Azure Blob, a local directory, or any S3-compatible store).
+sbproxy ships four reserve backends out of the box: memory, filesystem, redis, and object storage (S3, Google Cloud Storage, Azure Blob, a local directory, or any S3-compatible store).
 
 ## Configuration
 

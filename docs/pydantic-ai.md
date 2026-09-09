@@ -1,12 +1,12 @@
-# Pydantic AI with SBproxy
+# Pydantic AI with sbproxy
 
 *Last modified: 2026-08-19*
 
-A Pydantic AI agent produces two kinds of outbound traffic: completion calls to a model provider and tool calls to MCP servers. Point both at an SBproxy you run and everything the agent does crosses one gateway you control. That is where virtual keys scope which models an application may use and attribute its spend, budgets meter tokens and dollars, guardrails screen prompts and tool calls, and the usage ledger records what actually happened. On the Pydantic AI side the change is a provider with a different base URL and one toolset entry.
+A Pydantic AI agent produces two kinds of outbound traffic: completion calls to a model provider and tool calls to MCP servers. Point both at an sbproxy you run and everything the agent does crosses one gateway you control. That is where virtual keys scope which models an application may use and attribute its spend, budgets meter tokens and dollars, guardrails screen prompts and tool calls, and the usage ledger records what actually happened. On the Pydantic AI side the change is a provider with a different base URL and one toolset entry.
 
 ## Chat completions through the gateway
 
-SBproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so Pydantic AI's standard OpenAI model class works unchanged. Build an `OpenAIProvider` with the gateway's base URL and your virtual key, and hand the model to an `Agent`:
+sbproxy serves an OpenAI-compatible endpoint at `/v1/chat/completions`, so Pydantic AI's standard OpenAI model class works unchanged. Build an `OpenAIProvider` with the gateway's base URL and your virtual key, and hand the model to an `Agent`:
 
 ```python
 from pydantic_ai import Agent
@@ -125,7 +125,7 @@ The Pydantic AI snippet above works against the same stack unchanged. `docker co
 
 ## MCP tools through the gateway
 
-SBproxy is also a gateway for the Model Context Protocol, the JSON-RPC protocol agents use to discover and call tools. It aggregates any number of upstream MCP servers behind one endpoint at the origin root: clients send `tools/list` and `tools/call` to the gateway, which federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
+sbproxy is also a gateway for the Model Context Protocol, the JSON-RPC protocol agents use to discover and call tools. It aggregates any number of upstream MCP servers behind one endpoint at the origin root: clients send `tools/list` and `tools/call` to the gateway, which federates the catalog, applies guardrails, and routes each call to the upstream that owns the tool.
 
 A minimal `mcp` origin federating two upstream tool servers:
 
@@ -230,7 +230,7 @@ Every call the toolset makes goes through the gateway's controls: `tool_allowlis
 
 ## What you get at the gateway
 
-Routing both flows through SBproxy buys you, without any further code in the agent:
+Routing both flows through sbproxy buys you, without any further code in the agent:
 
 - Virtual keys with per-application model allow-lists and spend attribution, plus action-level budgets that turn a runaway agent into a 403 instead of an invoice. See [ai-gateway.md](ai-gateway.md).
 - Guardrails on prompts, completions, and tool calls at one choke point, so a policy change is a config edit rather than a redeploy.

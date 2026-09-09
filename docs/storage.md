@@ -1,7 +1,7 @@
 # Storage
 *Last modified: 2026-08-18*
 
-Storage means two things in SBproxy, and this page covers both. The `storage` action serves files out of an object store, the way a static-site origin or a bucket-backed CDN path would. Separately, the gateway itself persists state (certificates, cache entries, payment ledgers, config history), and knowing which backend holds what tells you what to back up, what is safe to lose, and where Redis actually becomes a requirement.
+Storage means two things in sbproxy, and this page covers both. The `storage` action serves files out of an object store, the way a static-site origin or a bucket-backed CDN path would. Separately, the gateway itself persists state (certificates, cache entries, payment ledgers, config history), and knowing which backend holds what tells you what to back up, what is safe to lose, and where Redis actually becomes a requirement.
 
 ## The `storage` action
 

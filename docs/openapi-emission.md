@@ -1,11 +1,11 @@
 # OpenAPI Emission
 *Last modified: 2026-08-28*
 
-SBproxy documents and governs your API. It does not just proxy it.
+sbproxy documents and governs your API. It does not just proxy it.
 
-When you put SBproxy in front of an upstream service, the gateway already knows the routes, the auth schemes, the rate limits, and the response cache. OpenAPI emission turns that knowledge into a published OpenAPI document (3.0.3 by default, 3.1 on request) that buyers can consume with standard tooling (Postman, Swagger UI, ReadMe.io, Stainless, SDK generators) without ever seeing your YAML config or talking to the upstream.
+When you put sbproxy in front of an upstream service, the gateway already knows the routes, the auth schemes, the rate limits, and the response cache. OpenAPI emission turns that knowledge into a published OpenAPI document (3.0.3 by default, 3.1 on request) that buyers can consume with standard tooling (Postman, Swagger UI, ReadMe.io, Stainless, SDK generators) without ever seeing your YAML config or talking to the upstream.
 
-The result: SBproxy is the single source of truth for what your API looks like, on the wire, right now.
+The result: sbproxy is the single source of truth for what your API looks like, on the wire, right now.
 
 This page covers emission: turning your config into a published spec. The
 companion policy, [OpenAPI schema validation](openapi-validation.md),
@@ -399,11 +399,11 @@ If you have a custom auth provider plugged in via the public plugin API, registe
 
 ## Why emission, not just proxying
 
-Most gateways ship an OpenAPI editor (you write the spec) or an OpenAPI importer (you feed in an upstream spec). SBproxy goes the other way: you configure routes, auth, caching, and rate limits on the gateway, and the gateway publishes an OpenAPI document derived from the running config. Reloads invalidate the cache; the next consumer fetch sees the new shape.
+Most gateways ship an OpenAPI editor (you write the spec) or an OpenAPI importer (you feed in an upstream spec). sbproxy goes the other way: you configure routes, auth, caching, and rate limits on the gateway, and the gateway publishes an OpenAPI document derived from the running config. Reloads invalidate the cache; the next consumer fetch sees the new shape.
 
 Where the config says something OpenAPI 3.0 cannot, the document says so in an extension rather than rounding it to the nearest thing the format allows. That is the whole bargain: everything the document states as an operation is a route the gateway serves, and the two `x-sbproxy-` lists above are where you look for the rest.
 
-That makes the gateway, not the upstream service, the source of truth for what your API looks like to the outside world. Buyers point their SDK generators, contract tests, and developer portals at SBproxy. When you change a route, the document changes. When you tighten an auth scheme, the document tightens.
+That makes the gateway, not the upstream service, the source of truth for what your API looks like to the outside world. Buyers point their SDK generators, contract tests, and developer portals at sbproxy. When you change a route, the document changes. When you tighten an auth scheme, the document tightens.
 
 You ship the gateway and you ship the spec, in one motion.
 
