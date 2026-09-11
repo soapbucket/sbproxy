@@ -1019,7 +1019,7 @@ names as though the proxy emitted them, and it emitted none of them.
 <!-- Generated from crates/sbproxy-observe/src/span_registry.rs. Do not hand-edit this block; run
      cargo run -q -p sbproxy-observe --bin generate-span-vocabulary -->
 
-Span names follow one of two conventions. sbproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
+Span names follow one of two conventions. SBproxy's own pillars are `sbproxy.<pillar>.<verb>`, with eight pillars: `intake`, `policy`, `action`, `transform`, `ledger`, `rail`, `audit`, and `notify`. The AI gateway spans instead follow the OpenTelemetry GenAI and OpenInference vocabularies, so LLM-native trace backends render them without remapping.
 
 The `Emitted` column is the one to read first. `yes` means production code opens the span and a drift guard proves it, by resolving the emitter against the source tree and requiring a call site outside tests. `not yet` means the name is reserved and published here and nothing opens it, so a trace query filtered on that name returns nothing. Four pillar spans cover an ordinary proxied request: the inbound phase, one per authentication check, one per policy evaluation, and one per response-body transform. The reserved names that remain are the payment, ledger, and audit ones, plus the settlement rail's second verb.
 
