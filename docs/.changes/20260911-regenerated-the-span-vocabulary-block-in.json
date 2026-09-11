@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "Regenerated the span-vocabulary block in `docs/observability.md`, which a docs sweep had hand-edited inside a generated region and left failing its drift guard."
+}
